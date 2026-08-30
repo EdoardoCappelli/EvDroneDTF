@@ -38,8 +38,19 @@ python3 extract_results.py --run-filter ablation_multidur --since 20260829
 ```
 
 ## Full model (detection+tracking+forecasting) 
+
+### Options
+| env | default | desc |
+|---|---|---|
+| `CUDA_VISIBLE_DEVICES` | `0` | GPU |
+| `WANDB_ENTITY` | `edoardocappelli099-org` | entity wandb |
+| `MIXED` | `0` | `1` = mixed query mode (p_std=0.4) |
+| `CV` | `0` | `1` = CV anchor in forecasting |
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 ./run_joint_p12_scratch_pastdrop_fakepast.sh
+MIXED=1 ./run_joint_p12_scratch_pastdrop_fakepast.sh # -> ..._pastdrop_fakepast_mixed
+CV=1 ./run_joint_p12_scratch_pastdrop_fakepast.sh # -> ..._pastdrop_fakepast_cv
+MIXED=1 CV=1 ./run_joint_p12_scratch_pastdrop_fakepast.sh # -> ..._pastdrop_fakepast_mixed_cv
 ```
 The script automatically evaluates the model once the training phase is ended.
 

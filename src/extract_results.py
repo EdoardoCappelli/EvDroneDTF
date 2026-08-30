@@ -1,21 +1,5 @@
 """
 Estrae detection / tracking / forecasting dai test log.
-
-Un solo `test_<run>.log` contiene TUTTI i pass concatenati (both, standard_only,
-forecasting, autoregressive), perché lo script di eval li fa `tee` nello stesso file.
-Per questo NON si può fare un `re.search` per file: il log va prima SPLITTATO in sezioni
-(ancorando ai marker stampati dall'evaluator), poi si estrae per-sezione.
-
-Config via argomenti CLI (robusti, indipendenti dalla shell) o env:
-  --runs-dir   / RUNS_DIR     cartella delle run   (default /equilibrium/ecappelli/runs)
-  --since      / SINCE        tiene run col timestamp nel nome >= SINCE, inclusivo;
-                              accetta 20260802 | 20260802_165603 | 2026-08-02  ("" = nessun filtro)
-  --run-filter / RUN_FILTER   tiene solo run che contengono la sottostringa   ("" = tutte)
-
-Esempi:
-  python extract_results.py --since 20260802
-  python extract_results.py --runs-dir /equilibrium/ecappelli/runs --since 20260802 --run-filter p12
-La config attiva è SEMPRE stampata a inizio esecuzione → si vede subito se --since è impostato.
 """
 import os
 import re

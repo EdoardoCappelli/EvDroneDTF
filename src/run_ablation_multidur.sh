@@ -3,47 +3,19 @@ source /andromeda/personal/ecappelli/miniconda3/bin/activate
 conda activate FRED++
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}   # override da env per lanci paralleli
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}  
 export HDF5_PLUGIN_PATH=/seidenas/datasets/FRED/plugins
 export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH
 
 set -euo pipefail
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  ABLATION MULTI-DURATA — "quanto aiuta l'input a multi-accumulazione?"
-#
-#  Allena lo STESSO detector (ricetta detector_scratch_p12_mixed: rami separati, P=12,
-#  mixed, da HF/COCO) variando SOLO le durate di accumulazione, e ne misura la mAP
-#  oracle (both + standard_only). Il trend mAP-vs-#durate risponde alla domanda.
-#
-#  Configurazioni (3):   33  |  33,165  |  33,165,330
-#  Obiettivo: verificare se la map_50 SALE aggiungendo accumuli (1 → 2 → 3 durate).
-#
-#  ▸ LANCI:
-#     - senza argomenti  →  cicla tutte e 3 in sequenza (1 GPU)
-#     - con un argomento →  allena SOLO quella config, per 3 lanci PARALLELI su 3 GPU:
-#         CUDA_VISIBLE_DEVICES=0 ./run_ablation_multidur.sh "33" &
-#         CUDA_VISIBLE_DEVICES=1 ./run_ablation_multidur.sh "33,165" &
-#         CUDA_VISIBLE_DEVICES=2 ./run_ablation_multidur.sh "33,165,330" &
-#
-#  ⚠️ CONFOUND (onestà sperimentale): rami SEPARATI = un RT-DETR per durata → più durate
-#     = più parametri. Il trend include quindi anche l'effetto-capacità. Va bene come
-#     ablation "del NOSTRO design multi-durata" (il modello finale è separate 33/165/330).
-#     Per isolare il SOLO effetto-input servirebbe un controllo a pesi condivisi
-#     (use_shared_weights=1): dimmelo e lo aggiungo come secondo script.
-#
-#  ▸ Config extra: puoi passare a mano "3,33,165,330" come argomento, ma richiede l'accumulo
-#     a 3 ms nel preprocessed FRED (altrimenti quella sola run fallisce al caricamento).
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ── Le 4 configurazioni di durata (o una sola se passata come argomento) ──
 if [ $# -ge 1 ]; then
     DUR_CONFIGS=("$1")
 else
     DUR_CONFIGS=("33" "33,165" "33,165,330")
 fi
 
-# ── Iperparametri FISSI: identici per TUTTE le config → unica variabile = le durate ──
+# ── Iperparametri identici per TUTTE le config --> unica variabile = le durate ──
 CONFIG="RTDetrPastConditioned"
 EPOCHS=20
 TRAIN_BATCH_SIZE=16
@@ -51,26 +23,24 @@ NUM_WORKERS=8
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-5
 OPTIMIZER="adamw"
-TRAIN_SUBSAMPLE=${SUBSAMPLE:-10}   # env: SUBSAMPLE=1 → dati pieni (numero finale). Default 10 (direzione)
-# tag run_name: sub-10 senza suffisso (compat coi run già fatti); altri subsample → suffisso s{N}_
+TRAIN_SUBSAMPLE=${SUBSAMPLE:-10} 
 if [ "${TRAIN_SUBSAMPLE}" = "10" ]; then SUBTAG=""; else SUBTAG="s${TRAIN_SUBSAMPLE}_"; fi
 USE_WANDB=1
 USE_NMS=0
 USE_ANNOTATED=0
 PHASE=2
-USE_MIXED_QUERY_MODE=${USE_MIXED:-1}   # env: USE_MIXED=0 → 'both' puro (ablation mixed vs no-mixed)
-# tag per distinguere i run_name delle due varianti
+USE_MIXED_QUERY_MODE=${USE_MIXED:-1} 
 if [ "${USE_MIXED_QUERY_MODE}" = "1" ]; then MIXTAG=""; else MIXTAG="nomix_"; fi
 P_BOTH=0.4
 P_PAST=0.2
 QUERY_MODE='both'
 NUM_STD_QUERIES=50
-NUM_PAST_ANNOTATIONS=12       # P=12, FISSO (varia solo la durata)
+NUM_PAST_ANNOTATIONS=12       
 USE_CUSTOM_NORMALIZATION=1
-SEED=42                       # stesso seed per tutte → confronto equo
+SEED=42 
 
 # rami separati (come il modello finale), detector-only (T=0), da scratch
-USE_SHARED_WEIGHTS=${SHARED:-0}   # env: SHARED=1 → pesi CONDIVISI (controllo capacità: #params costante al variare delle durate)
+USE_SHARED_WEIGHTS=${SHARED:-0} 
 if [ "${USE_SHARED_WEIGHTS}" = "1" ]; then SHTAG="shared_"; else SHTAG=""; fi
 SHARED_CAT=0
 NUM_FUTURE_ANNOTATIONS=0
@@ -98,7 +68,7 @@ VIS_EVERY_N_BATCHES=1000
 INDEX_PATH="/seidenas/datasets/FRED/preprocessed/"
 RUNS_DIR="/equilibrium/ecappelli/runs"
 
-# --- EVALUATION: mAP PIENA (subsample=1) per numeri affidabili anche se il train è sub-campionato ---
+# --- EVALUATION ---
 EVAL_BATCH_SIZE=16
 EVAL_SUBSAMPLE=1
 EVALUATOR_TYPE=past_conditioned_detr
@@ -106,8 +76,6 @@ EVAL_USE_NMS=1
 EVAL_USE_ANNOTATED=0
 EVAL_PROCESSOR_TH=0.3
 
-# Flag di architettura FISSI (identici train ed eval, o strict-load fallisce).
-# Le DURATE si passano a parte (--durations), perché sono l'unica cosa che varia.
 ARCH_ARGS=(
     --use_shared_weights "${USE_SHARED_WEIGHTS}"
     --shared_cat         "${SHARED_CAT}"
@@ -123,8 +91,8 @@ echo "#  subsample_train=${TRAIN_SUBSAMPLE}  epochs=${EPOCHS}  P=${NUM_PAST_ANNO
 echo "############################################################"
 
 for DURATION in "${DUR_CONFIGS[@]}"; do
-    DURATION="${DURATION// /}"                 # tolgo spazi ("3, 33" → "3,33")
-    DUR_TAG="${DURATION//,/_}"                  # "33,165,330" → "33_165_330"
+    DURATION="${DURATION// /}"          
+    DUR_TAG="${DURATION//,/_}"         
     RUN_NAME="ablation_multidur_${SUBTAG}${SHTAG}${MIXTAG}${DUR_TAG}"
     TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
     RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"

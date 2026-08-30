@@ -1,4 +1,4 @@
-# EVDroneDFT - Detection & Tracking & Forecasting from event cameras
+# EVDroneDFT  
 
 Past conditioned multi-duration RT-DETRv2 for drone detection, tracking and forecasting on FRED dataset.
 

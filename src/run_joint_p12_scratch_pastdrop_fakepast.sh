@@ -9,21 +9,6 @@ export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH
 
 set -euo pipefail
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  JOINT DETECTOR + FORECASTER — from scratch (COCO), P=12  ·  past_dropout + fake_past
-#
-#  Gemello di run_joint_p12_scratch.sh MA con USE_FAKE_PAST=1 (oltre a past_dropout).
-#  Perché: il joint con solo past_dropout (fake_past=0) in AR faceva MOTA −45 (track
-#  fantasma auto-sostenuti). Il fake_past è il killer diretto: insegna che un passato
-#  che punta a NON-droni → background → il track fantasma prende score basso → potato.
-#  (Il forecasting AMPLIFICA i fantasmi perché è allenato a estrapolare traiettorie,
-#  quindi qui il fake_past serve ancora di più.)
-#
-#  Alleno TUTTO insieme in 'both': ramo passato + ramo standard (loss UFFICIALE
-#  RT-DETR) + forecasting.
-#  🔴 use_shared_weights=0 (rami separati).  🔵 P=12 (400ms, competitor-comparable).
-#  ⚖️  std_loss_weight=0.5 per non schiacciare passato+forecasting.
-# ═════════════════════════════════════════════════════════════════════════════
 CONFIG="RTDetrPastConditioned"
 EPOCHS=20
 TRAIN_BATCH_SIZE=16
@@ -32,43 +17,42 @@ DURATION=33,165,330
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-5
 OPTIMIZER="adamw"
-TRAIN_SUBSAMPLE=10            # 10% = test di DIREZIONE. Per il numero del paper: 1
+TRAIN_SUBSAMPLE=10          
 USE_WANDB=1
 USE_NMS=0
 USE_ANNOTATED=0
 PHASE=2
-# ── QUERY MODE: 'both' puro (past + standard ogni batch) → forecasting allenato SEMPRE ──
 USE_MIXED_QUERY_MODE=0
 P_BOTH=0.6
 P_PAST=0.2
 QUERY_MODE='both'
 NUM_STD_QUERIES=50
-NUM_PAST_ANNOTATIONS=12       # <<< P=12
+NUM_PAST_ANNOTATIONS=12      
 USE_CUSTOM_NORMALIZATION=1
 SEED=42
 
-# --- RAMI SEPARATI (compatibilità forecasting) ---
+# --- RAMI SEPARATI ---
 USE_SHARED_WEIGHTS=0
 SHARED_CAT=0
 
 # ── FORECASTING (task ausiliario) ──
 NUM_FUTURE_ANNOTATIONS=24
-NUM_FUTURE_STEPS=24           # T=24 → riporta 0.4s (12 step) e 0.8s (24 step) dalla stessa run
+NUM_FUTURE_STEPS=24 
 FORECAST_HEAD_TYPE=transformer
-FORECAST_LOSS_WEIGHT=1.0      # DA TARARE {0.5,1.0,2.0}
-USE_CV_ANCHOR=0               # 0 = niente ancora CV → la testa impara il moto
+FORECAST_LOSS_WEIGHT=1.0      # tunable 
+USE_CV_ANCHOR=0               # 0 = no ancora CV -> la testa impara il moto
 VEL_AVG_K=3
-STD_LOSS_WEIGHT=0.5           # <<< bilancia il ramo standard vs passato+forecasting in joint
+STD_LOSS_WEIGHT=0.5           # bilancia il ramo standard vs passato+forecasting in joint
 
 # ── JOINT from scratch: da HF/COCO, allena tutto ──
 FREEZE_DETECTOR=0
-PRETRAINED_DETECTOR_PATH=""   # VUOTO = da HF (COCO)
+PRETRAINED_DETECTOR_PATH=""   
 TRAINABLE_WHEN_FROZEN=forecasting_head   # ignorato con FREEZE_DETECTOR=0
 
-# ── augmentation ANTI-FANTASMA: past_dropout + fake_past ON ──
+# ── augmentation: past_dropout + fake_past ON ──
 USE_PAST_DROPOUT=1
 PAST_DROPOUT_P=0.3
-USE_FAKE_PAST=1              # <<< la differenza vs run_joint_p12_scratch (era 0): killer dei track fantasma
+USE_FAKE_PAST=1             
 FAKE_PAST_P=0.3
 FAKE_MAX_K=3
 FAKE_COLLIDE_THR=0.15
@@ -83,7 +67,7 @@ VIS_FREQ=1000
 VIS_EVERY_N_BATCHES=1000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INDEX_PATH="/seidenas/datasets/FRED/preprocessed/"
-RESUME_CHECKPOINT=""          # FRESH
+RESUME_CHECKPOINT=""        
 
 # --- EVALUATION ---
 EVAL_BATCH_SIZE=16
@@ -93,7 +77,7 @@ EVAL_USE_NMS=1
 EVAL_USE_ANNOTATED=0
 EVAL_PROCESSOR_TH=0.3
 
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"   # FRESH: nuova RUN_DIR ogni lancio
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"   
 RUNS_DIR="/equilibrium/ecappelli/runs"
 RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"
 BEST_MODEL_PATH="${RUN_DIR}/checkpoints/best_model.pt"
@@ -102,13 +86,11 @@ TEST_LOG_FILE="${RUN_DIR}/test_${RUN_NAME}.log"
 
 AVAIL_G=$(df -BG --output=avail /equilibrium 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ "${AVAIL_G:-0}" -lt 25 ]; then
-    echo "❌ Solo ${AVAIL_G}G liberi su /equilibrium (rami separati → checkpoint pesante)."; exit 1
+    echo "❌ Solo ${AVAIL_G}G liberi su /equilibrium (rami separati -> checkpoint pesante)."; exit 1
 fi
 
 mkdir -p "${RUN_DIR}"
 
-# Flag di ARCHITETTURA: identici fra training ed eval, o strict-load fallisce.
-# num_past_annotations tocca la shape del PastEncoder → DEVE stare qui.
 ARCH_ARGS=(
     --use_shared_weights "${USE_SHARED_WEIGHTS}"
     --shared_cat         "${SHARED_CAT}"
@@ -123,8 +105,6 @@ ARCH_ARGS=(
     echo "============================================================"
     echo "  ${RUN_NAME} — Training (JOINT det+forecast, P=12, past_dropout+fake_past)"
     echo "  Run dir : ${RUN_DIR}  |  Free: ${AVAIL_G}G su /equilibrium"
-    echo "  Attesi nel log: NESSUN '[pretrained] Carico detector' (da HF) | '[forecasting] head = transformer'"
-    echo "  Spia fix: wandb train/std_loss_*_enc deve SCENDERE (enc_score_head impara)"
     echo "============================================================"
     set +e
     RESUME_ARGS=()
@@ -161,7 +141,7 @@ ARCH_ARGS=(
     set -e
 } 2>&1 | tee -a "${TRAIN_LOG_FILE}"
 
-# ── EVALUATION: mAP (both + standard_only + diag) → ADE/FDE → autoregressive ──
+# ── EVALUATION: mAP (both + standard_only + diag) -> ADE/FDE -> autoregressive ──
 {
     echo ""
     echo "============================================================"
@@ -172,7 +152,7 @@ ARCH_ARGS=(
     fi
     set +e
 
-    # 1) mAP detection: both e standard_only (standard_only = cold-start AR). diag = localizzazione.
+    # 1) mAP detection: both e standard_only (standard_only = cold-start AR).
     for QM in both standard_only; do
         echo "── DETECTION mAP (oracle) — query_mode=${QM} ──"
         python3 -u main.py \
@@ -184,8 +164,7 @@ ARCH_ARGS=(
             --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
             --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
             --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
-            --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0 \
-            --diag_best_iou 1
+            --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0
     done
 
     # 2) Forecasting ADE/FDE (EF=1, sulle query-passato)

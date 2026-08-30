@@ -14,7 +14,7 @@ Past conditioned multi-duration RT-DETRv2 for drone detection, tracking and fore
    export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH
    ```
 
-## Multi-accumulation ablation - `run_ablation_multidur.sh`
+## Multi-accumulation ablation  
 Train and evaluate the same detector varying the number of accumulations given as input to the model. It allows to measure how meaningfull is the multi-accumulated input. Seed=42 is used.
 
 
@@ -37,13 +37,13 @@ See the `train_*.log`, `test_*.log` for the details. In order to extract the eva
 python3 extract_results.py --run-filter ablation_multidur --since 20260829
 ```
 
-## Full model (detection+tracking+forecasting) - `run_joint_p12_scratch_pastdrop_fakepast.sh`
+## Full model (detection+tracking+forecasting) 
 ```bash
 CUDA_VISIBLE_DEVICES=0 ./run_joint_p12_scratch_pastdrop_fakepast.sh
 ```
 The script automatically evaluates the model once the training phase is ended.
 
-## 2) Detection / Tracking video - `create_detection_video.py`
+## Detection / Tracking video  
 The model is trained from scratch to detect, track and forecast drones.
 ```bash
 export HDF5_PLUGIN_PATH=/seidenas/datasets/FRED/plugins
@@ -58,7 +58,7 @@ python3 create_detection_video.py \
   --output detection.mp4
 ```
 
-## 3) Forecasting video - `create_forecast_video.py`
+## Forecasting video 
 ```bash
 export HDF5_PLUGIN_PATH=/seidenas/datasets/FRED/plugins
 export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH

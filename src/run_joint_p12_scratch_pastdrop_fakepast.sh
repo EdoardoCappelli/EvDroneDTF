@@ -3,12 +3,12 @@ source /andromeda/personal/ecappelli/miniconda3/bin/activate
 conda activate FRED++
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}   # override da env per lanci paralleli
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}    
 export HDF5_PLUGIN_PATH=/seidenas/datasets/FRED/plugins
 export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH
 
 set -euo pipefail
-
+ 
 CONFIG="RTDetrPastConditioned"
 EPOCHS=20
 TRAIN_BATCH_SIZE=16
@@ -22,12 +22,12 @@ USE_WANDB=1
 USE_NMS=0
 USE_ANNOTATED=0
 PHASE=2
-USE_MIXED_QUERY_MODE=0
-P_BOTH=0.6
+USE_MIXED_QUERY_MODE=${MIXED:-0}
+P_BOTH=0.4                        
 P_PAST=0.2
 QUERY_MODE='both'
 NUM_STD_QUERIES=50
-NUM_PAST_ANNOTATIONS=12      
+NUM_PAST_ANNOTATIONS=12       
 USE_CUSTOM_NORMALIZATION=1
 SEED=42
 
@@ -35,18 +35,18 @@ SEED=42
 USE_SHARED_WEIGHTS=0
 SHARED_CAT=0
 
-# ── FORECASTING (task ausiliario) ──
+# ── FORECASTING ──
 NUM_FUTURE_ANNOTATIONS=24
-NUM_FUTURE_STEPS=24 
+NUM_FUTURE_STEPS=24          
 FORECAST_HEAD_TYPE=transformer
-FORECAST_LOSS_WEIGHT=1.0      # tunable 
-USE_CV_ANCHOR=0               # 0 = no ancora CV -> la testa impara il moto
+FORECAST_LOSS_WEIGHT=1.0  
+USE_CV_ANCHOR=${CV:-0}        # env: CV=1 -> ancora a velocità costante (present + t·vel + delta)
 VEL_AVG_K=3
 STD_LOSS_WEIGHT=0.5           # bilancia il ramo standard vs passato+forecasting in joint
 
-# ── JOINT from scratch: da HF/COCO, allena tutto ──
+# ── JOINT from scratch ──
 FREEZE_DETECTOR=0
-PRETRAINED_DETECTOR_PATH=""   
+PRETRAINED_DETECTOR_PATH=""  
 TRAINABLE_WHEN_FROZEN=forecasting_head   # ignorato con FREEZE_DETECTOR=0
 
 # ── augmentation: past_dropout + fake_past ON ──
@@ -62,12 +62,15 @@ PERSISTENT_WORKERS=0
 WANDB_ENTITY=${WANDB_ENTITY:-edoardocappelli099-org}
 WANDB_PROJECT="joint_det_forecast"
 WANDB_DIR="/equilibrium/ecappelli"
-RUN_NAME="joint_scratch_p12_pastdrop_fakepast"
+_VARTAG=""
+[ "${USE_MIXED_QUERY_MODE}" = "1" ] && _VARTAG="${_VARTAG}_mixed"
+[ "${USE_CV_ANCHOR}" = "1" ] && _VARTAG="${_VARTAG}_cv"
+RUN_NAME="joint_scratch_p12_pastdrop_fakepast${_VARTAG}"
 VIS_FREQ=1000
 VIS_EVERY_N_BATCHES=1000
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INDEX_PATH="/seidenas/datasets/FRED/preprocessed/"
-RESUME_CHECKPOINT=""        
+RESUME_CHECKPOINT=""       
 
 # --- EVALUATION ---
 EVAL_BATCH_SIZE=16
@@ -77,7 +80,7 @@ EVAL_USE_NMS=1
 EVAL_USE_ANNOTATED=0
 EVAL_PROCESSOR_TH=0.3
 
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"   
+TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUNS_DIR="/equilibrium/ecappelli/runs"
 RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"
 BEST_MODEL_PATH="${RUN_DIR}/checkpoints/best_model.pt"
@@ -152,7 +155,7 @@ ARCH_ARGS=(
     fi
     set +e
 
-    # 1) mAP detection: both e standard_only (standard_only = cold-start AR).
+    # 1) mAP detection: both e standard_only (standard_only = cold-start AR). diag = localizzazione.
     for QM in both standard_only; do
         echo "── DETECTION mAP (oracle) — query_mode=${QM} ──"
         python3 -u main.py \
@@ -164,7 +167,8 @@ ARCH_ARGS=(
             --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
             --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
             --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
-            --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0
+            --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0 \
+            --diag_best_iou 1
     done
 
     # 2) Forecasting ADE/FDE (EF=1, sulle query-passato)

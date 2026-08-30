@@ -15,7 +15,7 @@ Past conditioned multi-duration RT-DETRv2 for drone detection, tracking and fore
    ```
 
 ## Multi-accumulation ablation - `run_ablation_multidur.sh`
-Train and evaluate the same detector varying the number of accumulations given as input to the model. It allows to measure how meaningfull is the multi-accumulated input.
+Train and evaluate the same detector varying the number of accumulations given as input to the model. It allows to measure how meaningfull is the multi-accumulated input. Seed=42 is used.
 
 
 | env | default | desc |

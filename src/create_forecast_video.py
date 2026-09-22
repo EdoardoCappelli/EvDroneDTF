@@ -1,6 +1,27 @@
+"""
+create_forecast_video.py — video del FORECASTING (traiettoria futura).
+
+Per la clip scelta disegna, ad ogni frame:
+  - GT presente (verde solido) + detection presente del modello (arancione solido)
+  - traiettoria FUTURA GT (verde tratteggiato, fade nel tempo)
+  - traiettoria FUTURA PREDETTA dalla testa forecasting (arancione tratteggiato)
+
+Due modalità di PASSATO (una per video):
+  --autoregressive 0  → passato ORACLE (GT)         → forecast dal passato vero
+  --autoregressive 1  → passato AUTOREGRESSIVO      → il passato lo ricostruisce il tracker
+
+Richiede un checkpoint con la testa forecasting (es. joint_scratch_p12_fakepast).
+
+⚠️ Script NUOVO (non testato in locale: niente GPU/dati qui). Se qualcosa non torna, il primo
+   sospetto è il caricamento del checkpoint (chiavi mancanti > testa forecasting) o il num_future.
+
+Riusa gli helper di create_detection_video.py (disegni, tracker, collate del passato).
+"""
 import argparse
+import json
 import os
 import subprocess
+import tempfile
 
 import numpy as np
 import torch
@@ -18,6 +39,51 @@ from create_detection_video import (
     scan_segments, build_collate,
     C_PRESENT_GT, C_PRED, C_TRACK_USED, C_PAST_GT,
 )
+
+C_FORECAST = '#00e5ff'   # ciano: forecast futuro (distinto dall'arancione della detection presente)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SPLIT — gira su uno split diverso (es. challenging) SENZA ri-preprocessare gli HDF5.
+# Come make_split_index.py: la cartella-sequenza di una finestra è
+#   hdf5_path = .../{folder}/Event/events.hdf5  →  folder = basename(dirname(dirname(...)))
+# Uno split è un .txt di cartelle. Le sequenze del challenging-test stanno in ENTRAMBE le
+# partizioni canonical (train+test) → si fa POOL di train+test e poi si filtra, così non si
+# perdono le sequenze che nel canonical erano nel train.
+# ══════════════════════════════════════════════════════════════════════════════
+def build_split_index(preprocessed_dir: str, acc_ms: int, split_txt: str) -> str:
+    """Pool train+test del preprocessed, tiene le finestre delle cartelle elencate in split_txt,
+    scrive un JSON temporaneo (metadati canonici) e ne ritorna il path (da passare come index_file)."""
+    with open(split_txt) as f:
+        want = {ln.strip().strip('/').strip() for ln in f if ln.strip()}
+
+    folder_of = lambda w: os.path.basename(os.path.dirname(os.path.dirname(w['hdf5_path'])))
+    pool, template = [], None
+    for name in ('train', 'test'):
+        p = os.path.join(preprocessed_dir, f'{name}_windows_{acc_ms}ms.json')
+        if not os.path.isfile(p):
+            print(f"[split] (assente, salto) {p}")
+            continue
+        with open(p) as f:
+            d = json.load(f)
+        if template is None:
+            template = {k: v for k, v in d.items() if k != 'windows'}   # metadati (accumulation_time_ms, ...)
+        pool.extend(d['windows'])
+    if not pool:
+        raise FileNotFoundError(f"[split] nessun *_windows_{acc_ms}ms.json in {preprocessed_dir}")
+
+    kept = [w for w in pool if folder_of(w) in want]
+    got = {folder_of(w) for w in kept}
+    missing = want - got
+    out = dict(template or {})
+    out['windows'] = kept
+    tmp = tempfile.NamedTemporaryFile('w', suffix=f'_split_windows_{acc_ms}ms.json', delete=False)
+    json.dump(out, tmp)
+    tmp.close()
+    print(f"[split] {os.path.basename(split_txt)}: pool {len(pool)} finestre | richieste {len(want)} "
+          f"seq | trovate {len(got)} | tenute {len(kept)} finestre -> {tmp.name}"
+          + (f"  [!] MANCANTI {sorted(missing)}" if missing else ""))
+    return tmp.name
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,13 +166,15 @@ def render_forecast(
                     a = max(0.15, 1.0 - t / max(fm.shape[1], 1) * 0.85)
                     _draw_box(ax, fg[i, t], C_PRESENT_GT, img_w, img_h, '--', 1.0, a)
 
-    # Futuro PREDETTO (arancione tratteggiato)
+    # Futuro PREDETTO (CIANO tratteggiato, fade con l'orizzonte; ultimo step piu marcato)
     if pred_future is not None and pred_future.shape[1] > 0:
         pf = pred_future[0].cpu().numpy()    # (N, T, 4)
+        T_fc = pf.shape[1]
         for i in range(pf.shape[0]):
-            for t in range(pf.shape[1]):
-                a = max(0.15, 1.0 - t / max(pf.shape[1], 1) * 0.85)
-                _draw_box(ax, pf[i, t], C_PRED, img_w, img_h, '--', 1.0, a)
+            for t in range(T_fc):
+                a = max(0.20, 1.0 - t / max(T_fc, 1) * 0.8)
+                lw = 2.2 if t == T_fc - 1 else 1.0        # ultimo step (orizzonte lontano) piu marcato
+                _draw_box(ax, pf[i, t], C_FORECAST, img_w, img_h, '--', lw, a)
 
     fig.suptitle(
         f'Frame {frame_idx:05d}  |  FORECAST  |  past={mode_label}',
@@ -117,7 +185,7 @@ def render_forecast(
             patches.Patch(facecolor='none', edgecolor=C_PRESENT_GT, linestyle='-',  label='GT presente'),
             patches.Patch(facecolor='none', edgecolor=C_PRESENT_GT, linestyle='--', label='GT futuro'),
             patches.Patch(facecolor='none', edgecolor=C_PRED,       linestyle='-',  label='Detection presente'),
-            patches.Patch(facecolor='none', edgecolor=C_PRED,       linestyle='--', label='Forecast futuro'),
+            patches.Patch(facecolor='none', edgecolor=C_FORECAST,   linestyle='--', label='Forecast futuro'),
             patches.Patch(facecolor='none', edgecolor=C_TRACK_USED, linestyle='--', label='Past usato (valido)'),
             patches.Patch(facecolor='none', edgecolor=C_PAST_GT,    linestyle='--', label='Track non valido'),
         ],
@@ -161,12 +229,23 @@ def main(args):
               "o P/durate non combaciano.")
     model.to(device).eval()
 
+    # Split diverso (es. challenging): rifiltra le finestre e usa un index temporaneo.
+    index_path = args.index
+    if args.split_txt:
+        prep_dir = args.preprocessed or os.path.dirname(os.path.abspath(args.index))
+        index_path = build_split_index(prep_dir, args.acc_ms, args.split_txt)
+
     dataset = FREDMultiDurationTensorDatasetTracking(
-        index_file=args.index, width=args.img_width, height=args.img_height,
+        index_file=index_path, width=args.img_width, height=args.img_height,
         durations_ms=args.durations, render_mode=args.render_mode,
         subsample=1, num_past_annotations=args.num_past_steps,
         num_future_annotations=args.num_future_steps,
     )
+    if args.split_txt and index_path != args.index:
+        try:
+            os.remove(index_path)   # l'index è già in memoria (self.windows) → il temp non serve più
+        except OSError:
+            pass
 
     if args.scan:
         min_len = args.clip_seconds * args.fps
@@ -191,6 +270,8 @@ def main(args):
     )
 
     mode_label = 'AR' if args.autoregressive else 'oracle'
+    if args.autoregressive and args.std_box_priority:
+        mode_label = 'AR_stdprio'   # tag distinto → non sovrascrive il video M4
     out_path = args.output.replace('.mp4', f'_{mode_label}.mp4')
     raw_path = out_path.replace('.mp4', '_raw.avi')
     writer, n_written = None, 0
@@ -241,22 +322,52 @@ def main(args):
             past_b, past_s = pred_boxes[:N].cpu().numpy(), scores[:N].cpu().numpy()
             std_b,  std_s  = pred_boxes[N:].cpu().numpy(), scores[N:].cpu().numpy()
             updated, past_det_boxes = set(), []
-            for t, b, s in zip(valid, past_b, past_s):
-                if s > args.conf_thr:
-                    t.update(b, float(s)); updated.add(t); past_det_boxes.append(b)
-                else:
-                    t.missed += 1
-            for i in np.argsort(-std_s):
-                if std_s[i] <= args.conf_thr:
-                    break
-                b, s = std_b[i], float(std_s[i])
-                if any(box_iou_cxcywh(b, pbx) >= args.std_past_iou_thr for pbx in past_det_boxes):
-                    continue
-                m = best_match_track(tracks, b, args.iou_thr, args.dist_thr, exclude=updated)
-                if m is not None:
-                    m.update(b, s); updated.add(m)
-                else:
-                    tracks.append(Track(b, s, P))
+            if args.std_box_priority:
+                # MERGE-FIX (standard over past): la box STANDARD (più fresca) aggiorna il track;
+                # il passato riempie i buchi e dà l'identità. Cambia il PASSATO ricostruito → in
+                # closed-loop si propaga ai frame successivi. Speculare al ramo dell'evaluator.
+                past_out = {t: (b, float(s)) for t, b, s in zip(valid, past_b, past_s)}
+                std_for_track = {}
+                for i in np.argsort(-std_s):                     # 1) standard prima: associa o spawn
+                    if std_s[i] <= args.conf_thr:
+                        break
+                    b, s = std_b[i], float(std_s[i])
+                    m = best_match_track(tracks, b, args.iou_thr, args.dist_thr, exclude=updated)
+                    if m is not None:
+                        std_for_track[m] = (b, s); updated.add(m)
+                    else:
+                        # anti-duplicato: se ricalca la box-passato di un track valido → è quel track
+                        hit = next((t for t in valid if t not in updated
+                                    and past_out.get(t, (None, 0.0))[1] > args.conf_thr
+                                    and box_iou_cxcywh(b, past_out[t][0]) >= args.std_past_iou_thr), None)
+                        if hit is not None:
+                            std_for_track[hit] = (b, s); updated.add(hit)
+                        else:
+                            nt = Track(b, s, P); tracks.append(nt); updated.add(nt)
+                for t in tracks:                                 # 2) emissione: standard se c'è, altrimenti past
+                    if t in std_for_track:
+                        b, s = std_for_track[t]; t.update(b, s)
+                    elif past_out.get(t, (None, 0.0))[1] > args.conf_thr:
+                        b, s = past_out[t]; t.update(b, float(s)); updated.add(t)
+            else:
+                # M4 (default, past over standard): il passato aggiorna i track; una detection
+                # standard che ricalca (IoU≥) una box-passato viene scartata.
+                for t, b, s in zip(valid, past_b, past_s):
+                    if s > args.conf_thr:
+                        t.update(b, float(s)); updated.add(t); past_det_boxes.append(b)
+                    else:
+                        t.missed += 1
+                for i in np.argsort(-std_s):
+                    if std_s[i] <= args.conf_thr:
+                        break
+                    b, s = std_b[i], float(std_s[i])
+                    if any(box_iou_cxcywh(b, pbx) >= args.std_past_iou_thr for pbx in past_det_boxes):
+                        continue
+                    m = best_match_track(tracks, b, args.iou_thr, args.dist_thr, exclude=updated)
+                    if m is not None:
+                        m.update(b, s); updated.add(m)
+                    else:
+                        tracks.append(Track(b, s, P))
             for t in tracks:
                 if t not in updated:
                     t.missed += 1
@@ -306,6 +417,14 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--index', default='/seidenas/datasets/FRED/preprocessed/test_windows_33ms.json')
+    # ── split diverso (es. challenging) senza ri-preprocessare ──
+    p.add_argument('--split_txt', default='',
+                   help="gira su uno split diverso: .txt con le cartelle-sequenza del test (es. "
+                        "challenging_test_split.txt). Fa pool(train+test) del preprocessed e filtra.")
+    p.add_argument('--preprocessed', default='',
+                   help="dir preprocessed canonical per il pool train+test (default: cartella di --index). Solo con --split_txt")
+    p.add_argument('--acc_ms', type=int, default=33,
+                   help="accumulazione dei window json (per trovare {train,test}_windows_<acc>ms.json con --split_txt)")
     p.add_argument('--output', default='forecast.mp4')
     p.add_argument('--query_mode', choices=['both', 'past_only', 'standard_only'], default='both')
     p.add_argument('--num_standard_queries', type=int, default=50)
@@ -338,6 +457,9 @@ if __name__ == '__main__':
     p.add_argument('--iou_thr', type=float, default=0.2)
     p.add_argument('--dist_thr', type=float, default=0.08)
     p.add_argument('--std_past_iou_thr', type=float, default=0.3)
+    p.add_argument('--std_box_priority', type=int, default=0,
+                   help="1 = merge-fix (standard over past): la box standard fresca aggiorna il "
+                        "track, il passato riempie i buchi. 0 = M4 (past over standard, default).")
     p.add_argument('--max_missed', type=int, default=6)
     p.add_argument('--num_workers', type=int, default=4)
     main(p.parse_args())

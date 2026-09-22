@@ -70,9 +70,12 @@ def split_sections(content):
     # forecasting: header  "  FORECASTING"
     for m in re.finditer(r"(?m)^\s*FORECASTING\s*$", content):
         anchors.append((m.start(), "forecasting"))
-    # autoregressive:  "  MODE : AUTOREGRESSIVE (closed-loop)"
-    for m in re.finditer(r"MODE\s*:\s*AUTOREGRESSIVE", content):
-        anchors.append((m.start(), "autoregressive"))
+    # autoregressive: "MODE : AUTOREGRESSIVE (closed-loop)" oppure "(oracle-past)". La variante
+    # fra parentesi separa AR (passato predetto) da oracle (passato GT). Retro-compat: senza
+    # parentesi (log vecchi) → 'autoregressive'.
+    for m in re.finditer(r"MODE\s*:\s*AUTOREGRESSIVE(?:\s*\(([^)]*)\))?", content):
+        variant = (m.group(1) or "").lower()
+        anchors.append((m.start(), "autoregressive_oracle" if "oracle" in variant else "autoregressive"))
     anchors.sort(key=lambda a: a[0])
     sections = []
     for i, (pos, label) in enumerate(anchors):
@@ -91,8 +94,8 @@ def parse_test_log(path):
         elif label == "forecasting":
             metrics = extract(text, FORECAST_PATTERNS)
             metrics.update(extract_per_step_ade(text))
-        elif label == "autoregressive":
-            # AR: mAP + prec/rec/f1 closed-loop  +  tracking
+        elif label.startswith("autoregressive"):
+            # AR / oracle: mAP + prec/rec/f1 closed-loop  +  tracking (MOTA/IDF1/ID-sw/MOTP)
             metrics = extract(text, DET_PATTERNS)
             metrics.update(extract(text, TRACK_PATTERNS))
         else:
@@ -105,16 +108,17 @@ def parse_test_log(path):
 
 def run_after(run_name, since):
     """True se il timestamp nel nome run (..._YYYYMMDD_HHMMSS) è >= since (inclusivo).
+    Il timestamp è SEMPRE in coda (RUN_DIR = <run_name>_YYYYMMDD_HHMMSS): gli ultimi due
+    campi separati da '_' → [-2] = YYYYMMDD (data), [-1] = HHMMSS (ora).
     Confronto su cifre: YYYYMMDD[HHMMSS] ordina lessicograficamente = cronologicamente."""
     if not since:
         return True
-    matches = re.findall(r"(\d{8})_(\d{6})", run_name)   # tutti i YYYYMMDD_HHMMSS
-    if not matches:
-        return False                              # SINCE attivo ma niente data → escludo
-    d, t = matches[-1]                            # l'ultimo = il timestamp finale della run
-    run_digits = d + t                            # YYYYMMDDHHMMSS
+    parts = run_name.split('_')
+    d, t = (parts[-2], parts[-1]) if len(parts) >= 2 else ('', '')
+    if not (len(d) == 8 and d.isdigit() and len(t) == 6 and t.isdigit()):
+        return False                              # SINCE attivo ma niente timestamp valido → escludo
     since_digits = re.sub(r"\D", "", since)        # tengo solo le cifre di SINCE
-    return run_digits[:len(since_digits)] >= since_digits
+    return (d + t)[:len(since_digits)] >= since_digits
 
 
 def parse_durations(train_log):
@@ -133,6 +137,60 @@ def parse_checkpoint_epoch(test_logs):
         if m:
             return m.group(1)
     return "N/A"
+
+
+# ── query_mixed / shared: dal config.json della run ──────────────────────────
+#    Fonte autorevole = config.json scritto dal trainer (self.config.to_json()).
+#    PREFERISCO quello in checkpoints/ (config di TRAINING): l'evaluator ne scrive
+#    un altro a livello-run che può avere use_mixed_query_mode al default (0),
+#    perché in eval quel flag non si passa → sarebbe fuorviante.
+def find_config_json(run_path):
+    """config.json della run, dando priorità a quello di training (checkpoints/)."""
+    prefer = run_path / "checkpoints" / "config.json"
+    if prefer.is_file():
+        return prefer
+    ckpt_hits = [p for p in run_path.rglob("config.json") if p.parent.name == "checkpoints"]
+    if ckpt_hits:
+        return ckpt_hits[0]
+    top = run_path / "config.json"
+    if top.is_file():
+        return top
+    return next(iter(run_path.rglob("config.json")), None)
+
+
+def _find_in_config(obj, key):
+    """Cerca `key` a qualunque livello del config (top-level ha priorità sui *_args)."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_in_config(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def parse_config_flags(run_path):
+    """{query_mixed, shared} dal config.json della run — '1' / '0' / 'N/A'."""
+    cfg_path = find_config_json(run_path)
+    if cfg_path is None:
+        return {"query_mixed": "N/A", "shared": "N/A"}
+    try:
+        cfg = json.loads(cfg_path.read_text(errors="ignore"))
+    except Exception:
+        return {"query_mixed": "N/A", "shared": "N/A"}
+
+    def _fmt(key):
+        v = _find_in_config(cfg, key)
+        if v is None:
+            return "N/A"
+        truthy = (v is True) or (isinstance(v, (int, float)) and v != 0) \
+                 or str(v).strip().lower() in ('1', 'true', 'yes', 'on')
+        return "1" if truthy else "0"
+
+    return {"query_mixed": _fmt("use_mixed_query_mode"),
+            "shared":      _fmt("use_shared_weights"),
+            "cv_anchor":   _fmt("use_cv_anchor")}
 
 
 def main():
@@ -178,17 +236,22 @@ def main():
         if not evaluations:
             continue
 
+        cfg_flags = parse_config_flags(run_path)
         all_runs.append({
             "nome_run":    run_path.name,
             "durations":   parse_durations(next(run_path.glob("train_*.log"), None)),
             "checkpoint_epoch": parse_checkpoint_epoch(test_logs),
+            "query_mixed": cfg_flags["query_mixed"],
+            "shared":      cfg_flags["shared"],
+            "cv_anchor":   cfg_flags["cv_anchor"],
             "evaluations": evaluations,
         })
 
     # ── Stampa leggibile ──
     for run in all_runs:
         print("=" * 72)
-        print(f"RUN: {run['nome_run']}   (durations: {run['durations']}  |  ckpt epoch: {run['checkpoint_epoch']})")
+        print(f"RUN: {run['nome_run']}   (durations: {run['durations']}  |  ckpt epoch: {run['checkpoint_epoch']}"
+              f"  |  query_mixed: {run['query_mixed']}  |  shared: {run['shared']}  |  cv_anchor: {run['cv_anchor']})")
         for label in sorted(run["evaluations"]):
             ev = run["evaluations"][label]
             base = {k: v for k, v in ev.items() if not k.startswith("ADE_t")}

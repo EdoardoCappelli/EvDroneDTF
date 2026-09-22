@@ -10,10 +10,10 @@ export LD_LIBRARY_PATH=/seidenas/datasets/FRED/plugins:$LD_LIBRARY_PATH
 set -euo pipefail
  
 CONFIG="RTDetrPastConditioned"
-EPOCHS=20
+EPOCHS=${EPOCHS:-20}          # env: EPOCHS=40 ./run_... per il test "train longer"
 TRAIN_BATCH_SIZE=16
 NUM_WORKERS=8
-DURATION=33,165,330
+DURATION=${DURATION:-33,165,330}
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-5
 OPTIMIZER="adamw"
@@ -79,11 +79,14 @@ EVALUATOR_TYPE=past_conditioned_detr
 EVAL_USE_NMS=1
 EVAL_USE_ANNOTATED=0
 EVAL_PROCESSOR_TH=0.3
+AR_STD_BOX_PRIORITY=${STDBOX:-0}   # env: STDBOX=1 → merge-fix (box standard vince, il passato riempie i buchi + dà identità → AR ≥ standard). 0 = M4 (passato prioritario)
+AR_CONF_THR=${AR_CONF:-0.65}       # soglia score detection CORRENTE del tracker AR (default config 0.35; qui tarato 0.65). env: AR_CONF=0.5 ./run_...
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUNS_DIR="/equilibrium/ecappelli/runs"
 RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"
 BEST_MODEL_PATH="${RUN_DIR}/checkpoints/best_model.pt"
+BEST_MODEL_PATH="${RUN_DIR}/checkpoints/last_checkpoint.pt"
 TRAIN_LOG_FILE="${RUN_DIR}/train_${RUN_NAME}.log"
 TEST_LOG_FILE="${RUN_DIR}/test_${RUN_NAME}.log"
 
@@ -101,6 +104,9 @@ ARCH_ARGS=(
     --num_future_annotations "${NUM_FUTURE_ANNOTATIONS}"
     --num_future_steps       "${NUM_FUTURE_STEPS}"
     --forecast_head_type     "${FORECAST_HEAD_TYPE}"
+    --use_past_class_head    "${USE_PAST_CLASS_HEAD}"
+    --block_diag_decoder_attn "${BLOCK_DIAG}"
+    --render_mode            "${RENDER_MODE}"
 )
 
 # ── TRAINING ──
@@ -136,6 +142,8 @@ ARCH_ARGS=(
         --use_mixed_query_mode "${USE_MIXED_QUERY_MODE}" --p_both "${P_BOTH}" --p_past "${P_PAST}" \
         --forecast_loss_weight "${FORECAST_LOSS_WEIGHT}" --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
         --std_loss_weight "${STD_LOSS_WEIGHT}" \
+        --select_exclude_cls "${SELECT_NO_CLS}" \
+        --use_past_aug "${USE_PAST_AUG}" --past_aug_std "${PAST_AUG_STD}" \
         "${ARCH_ARGS[@]}" \
         "${RESUME_ARGS[@]}" \
         --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
@@ -148,7 +156,7 @@ ARCH_ARGS=(
 {
     echo ""
     echo "============================================================"
-    echo "  ${RUN_NAME} — Evaluation (mAP + ADE/FDE + autoregressive)"
+    echo "  ${RUN_NAME} — Evaluation (mAP + ADE/FDE + tracking AR)"
     echo "============================================================"
     if [ ! -f "${BEST_MODEL_PATH}" ]; then
         echo "❌ best_model.pt non trovato: ${BEST_MODEL_PATH}"; exit 1
@@ -156,7 +164,7 @@ ARCH_ARGS=(
     set +e
 
     # 1) mAP detection: both e standard_only (standard_only = cold-start AR). diag = localizzazione.
-    for QM in both standard_only; do
+    for QM in standard_only; do
         echo "── DETECTION mAP (oracle) — query_mode=${QM} ──"
         python3 -u main.py \
             --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
@@ -184,19 +192,21 @@ ARCH_ARGS=(
         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
         --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 1 --autoregressive 0
 
-    # 3) Autoregressive closed-loop (+ export MOT + motmetrics)
-    echo "── AUTOREGRESSIVE closed-loop (--autoregressive 1 + export MOT) ──"
+    # 3) TRACKING autoregressivo closed-loop (passato = predizioni del modello; + export MOT + motmetrics)
+    echo "── TRACKING AR closed-loop (--ar_oracle_past 0, merge-fix std_box_priority=${AR_STD_BOX_PRIORITY}) ──"
     python3 -u main.py \
         --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
         --checkpoint_path "${BEST_MODEL_PATH}" --test_batch_size "${EVAL_BATCH_SIZE}" \
-        --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample "${EVAL_SUBSAMPLE}" \
+        --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample 1 \
         --index_path "${INDEX_PATH}/" --phase "${PHASE}" --query_mode both \
         --num_standard_queries "${NUM_STD_QUERIES}" "${ARCH_ARGS[@]}" \
         --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
         --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
         --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 1 \
-        --ar_export_mot 1
+        --ar_oracle_past 0 --ar_export_mot 1 --ar_std_box_priority "${AR_STD_BOX_PRIORITY}" \
+        --ar_conf_thr "${AR_CONF_THR}"
+
     set -e
     echo "  Evaluation finished"
 } 2>&1 | tee -a "${TEST_LOG_FILE}"

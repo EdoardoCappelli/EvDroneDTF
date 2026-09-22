@@ -1,0 +1,76 @@
+[
+    {
+        "nome_run": "joint_scratch_p12_pastdrop_fakepast_pastaug_20260920_155556",
+        "durations": "165",
+        "checkpoint_epoch": "19",
+        "query_mixed": "0",
+        "shared": "0",
+        "cv_anchor": "0",
+        "evaluations": {
+            "detection_both": {
+                "map": "0.5430",
+                "map_50": "0.9568",
+                "map_75": "0.5610",
+                "mar_100": "0.6415",
+                "precision": "0.9554",
+                "recall": "0.9623",
+                "f1": "0.9588"
+            },
+            "detection_standard_only": {
+                "map": "0.3839",
+                "map_50": "0.8358",
+                "map_75": "0.2873",
+                "mar_100": "0.4822",
+                "precision": "0.8882",
+                "recall": "0.8482",
+                "f1": "0.8677"
+            },
+            "forecasting": {
+                "ADE_full": "28.14",
+                "FDE_full": "60.87",
+                "ADE_0.4s": "13.46",
+                "FDE_0.4s": "24.50",
+                "ADE_0.8s": "28.14",
+                "FDE_0.8s": "60.87",
+                "mean_iou": "0.3962",
+                "ADE_t1": "4.5",
+                "ADE_t2": "5.8",
+                "ADE_t3": "7.2",
+                "ADE_t4": "8.7",
+                "ADE_t5": "10.3",
+                "ADE_t6": "12.0",
+                "ADE_t7": "13.8",
+                "ADE_t8": "15.7",
+                "ADE_t9": "17.7",
+                "ADE_t10": "19.8",
+                "ADE_t11": "22.1",
+                "ADE_t12": "24.5",
+                "ADE_t13": "27.0",
+                "ADE_t14": "29.7",
+                "ADE_t15": "32.4",
+                "ADE_t16": "35.2",
+                "ADE_t17": "38.2",
+                "ADE_t18": "41.2",
+                "ADE_t19": "44.4",
+                "ADE_t20": "47.5",
+                "ADE_t21": "50.8",
+                "ADE_t22": "54.1",
+                "ADE_t23": "57.4",
+                "ADE_t24": "60.9"
+            },
+            "autoregressive": {
+                "map": "0.3068",
+                "map_50": "0.7069",
+                "map_75": "0.2081",
+                "mar_100": "0.5036",
+                "precision": "0.8292",
+                "recall": "0.8246",
+                "f1": "0.8269",
+                "MOTA": "0.6443",
+                "IDF1": "0.3984",
+                "ID_switches": "1411",
+                "MOTP": "0.7381"
+            }
+        }
+    }
+]

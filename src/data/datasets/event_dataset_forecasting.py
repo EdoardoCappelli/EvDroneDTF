@@ -254,17 +254,98 @@ def parse_annotations_normalized(annotations, width, height):
 # FRAME RENDERER
 # ============================================================================
 
+@njit(cache=True)
+def render_time_surface_numba(x, y, p, age_us, tau_us, height, width):
+    """Time-surface HOTS (Lagorce et al., IEEE TPAMI 2017) — formula UFFICIALE, per-polarita.
+        S_p(x,y) = exp(-(t_ref - T_p(x,y)) / tau)
+    con t_ref = tempo di riferimento (fine finestra), T_p = tempo dell'ULTIMO evento di polarita p
+    sul pixel, tau = costante di decadimento. Qui age_us[i] = (t_ref - t_i) in MICROSECONDI (>=0)
+    e tau_us in microsecondi. Uscita 3 canali: [S_on, S_off, 0] (2 canali HOTS + zero-pad per il
+    backbone RGB pre-allenato)."""
+    min_age_pos = np.full((height, width), -1.0, dtype=np.float32)   # eta' (µs) ultimo ON, -1 = assente
+    min_age_neg = np.full((height, width), -1.0, dtype=np.float32)   # eta' (µs) ultimo OFF
+    for i in range(len(x)):
+        xi = x[i]
+        yi = y[i]
+        if 0 <= xi < width and 0 <= yi < height:
+            a = age_us[i]
+            if p[i] > 0:
+                if min_age_pos[yi, xi] < 0.0 or a < min_age_pos[yi, xi]:   # ULTIMO evento = eta' minore
+                    min_age_pos[yi, xi] = a
+            else:
+                if min_age_neg[yi, xi] < 0.0 or a < min_age_neg[yi, xi]:
+                    min_age_neg[yi, xi] = a
+    out = np.zeros((height, width, 3), dtype=np.float32)
+    for yi in range(height):
+        for xi in range(width):
+            ap = min_age_pos[yi, xi]
+            an = min_age_neg[yi, xi]
+            if ap >= 0.0:
+                out[yi, xi, 0] = np.exp(-ap / tau_us)
+            if an >= 0.0:
+                out[yi, xi, 1] = np.exp(-an / tau_us)
+    return out
+
+
+@njit(cache=True)
+def render_tencode_numba(x, y, p, age_us, height, width):
+    """TENCODE (Huang et al., WACV 2023) — formula UFFICIALE, 3 canali RGB.
+        on-event : (R,G,B) = (1, (t_max - t)/(t_max - t_min), 0)
+        off-event: (R,G,B) = (0, (t_max - t)/(t_max - t_min), 1)
+    Per ogni pixel vince l'ULTIMO evento. G = eta' normalizzata sullo span: newest -> 0, oldest -> 1
+    (in eta': age_min -> 0, age_max -> 1). age_us[i] = (t_ref - t_i) in µs."""
+    n = len(x)
+    amin = age_us[0]                                   # span delle eta' per normalizzare G
+    amax = age_us[0]
+    for i in range(1, n):
+        a = age_us[i]
+        if a < amin:
+            amin = a
+        if a > amax:
+            amax = a
+    span = amax - amin
+    min_age = np.full((height, width), -1.0, dtype=np.float32)   # eta' ultimo evento sul pixel
+    pol = np.zeros((height, width), dtype=np.int8)               # +1 ON / -1 OFF dell'ultimo evento
+    for i in range(n):
+        xi = x[i]
+        yi = y[i]
+        if 0 <= xi < width and 0 <= yi < height:
+            a = age_us[i]
+            if min_age[yi, xi] < 0.0 or a < min_age[yi, xi]:      # piu recente = eta' minore
+                min_age[yi, xi] = a
+                pol[yi, xi] = 1 if p[i] > 0 else -1
+    out = np.zeros((height, width, 3), dtype=np.float32)
+    for yi in range(height):
+        for xi in range(width):
+            if pol[yi, xi] == 0:
+                continue
+            g = 0.0 if span <= 0.0 else (min_age[yi, xi] - amin) / span
+            if pol[yi, xi] > 0:
+                out[yi, xi, 0] = 1.0   # R = ON
+            else:
+                out[yi, xi, 2] = 1.0   # B = OFF
+            out[yi, xi, 1] = g         # G = (t_max - t)/(t_max - t_min)
+    return out
+
+
 class EventFrameRenderer:
     """Renders event data into frames with different modes."""
 
-    def __init__(self, width, height, render_mode='metavision'):
+    def __init__(self, width, height, render_mode='metavision', ts_tau_frac=0.5):
         self.width = width
         self.height = height
         self.render_mode = render_mode
+        # tau del time-surface HOTS come FRAZIONE della durata finestra: tau_d = ts_tau_frac * durata_d.
+        # Per-scala -> ogni durata (33/165/330ms) mostra la sua scia (un tau FISSO farebbe sparire la
+        # scia delle finestre lunghe). Decadimento = exp() ufficiale HOTS; riporta ts_tau_frac nel paper.
+        self.ts_tau_frac = ts_tau_frac
         self.num_channels = 1 if render_mode == 'delta' else 3
 
-    def render(self, x, y, p):
-        """Render events to frame based on render_mode."""
+    def render(self, x, y, p, t=None, tau_us=None):
+        """Render events to frame based on render_mode.
+        t = ETA' dell'evento in MICROSECONDI rispetto alla fine finestra (t_ref - t_evento, >=0);
+        tau_us = tau del time-surface in µs (per-scala, passato dal chiamante). Servono alle
+        modalita temporali (time_surface HOTS, tencode); le altre li ignorano."""
         if len(x) == 0:
             if self.render_mode == 'delta':
                 return np.zeros((self.height, self.width), dtype=np.float32)
@@ -280,6 +361,15 @@ class EventFrameRenderer:
             return render_metavision_blue_white_numba(x, y, p, self.height, self.width)
         elif self.render_mode == 'metavision_acc':
             return render_metavision_accumulate_numba(x, y, p, self.height, self.width)
+        elif self.render_mode == 'time_surface':
+            if t is None or tau_us is None:
+                raise ValueError("render_mode='time_surface' richiede t (eta' in µs) e tau_us")
+            return render_time_surface_numba(x, y, p, t.astype(np.float32),
+                                             np.float32(tau_us), self.height, self.width)
+        elif self.render_mode == 'tencode':
+            if t is None:
+                raise ValueError("render_mode='tencode' richiede t = eta' evento in µs")
+            return render_tencode_numba(x, y, p, t.astype(np.float32), self.height, self.width)
         else:
             raise ValueError(f"Unknown render mode: {self.render_mode}")
 
@@ -575,7 +665,10 @@ class FREDMultiDurationDataset(Dataset):
             for duration_us in self._duration_us:
                 t_start = t_end - duration_us
                 mask = t_all >= t_start
-                frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask])
+                tm = t_all[mask]
+                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None   # eta' in µs (t_ref = fine finestra)
+                tau_us = self.renderer.ts_tau_frac * duration_us   # tau per-scala = frazione della durata
+                frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask], age, tau_us)
                 images[duration_us // 1000] = self.renderer.to_pil(frame)
         else:
             empty_frame = self.renderer.render(
@@ -757,7 +850,12 @@ class FREDMultiDurationTensorDatasetTracking(Dataset):
             for duration_us in self._duration_us:
                 t_start = t_end - duration_us
                 mask = t_all >= t_start
-                frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask])
+                # eta' dell'evento in µs rispetto alla FINE finestra (t_ref - t): usata dalle
+                # modalita temporali (time_surface HOTS / tencode). None se finestra vuota.
+                tm = t_all[mask]
+                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None
+                tau_us = self.renderer.ts_tau_frac * duration_us   # tau per-scala = frazione della durata
+                frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask], age, tau_us)
                 frames[duration_us // 1000] = self.renderer.to_tensor(frame)
         else:
             for d in self.durations_ms:

@@ -1,3 +1,5 @@
+# from models.er_detr_multiscale_attention import MultiDurationDetrAttention as ErDetrMultiScaleAttention
+# from models.er_detr import MultimodalPretrainedDetr as ErDetr
 from models.Multiscale_ERT_Detr import MultiDurationRTDetrAttention as RtDetrMultiScaleAttention
 
 def get_model(model_type, device, config):
@@ -50,6 +52,7 @@ def get_model(model_type, device, config):
             use_shared_weights=bool(getattr(config, 'use_shared_weights', 0)),
             shared_cat=bool(getattr(config, 'shared_cat', 0)),
             block_diag_decoder_attn=bool(getattr(config, 'block_diag_decoder_attn', 0)),
+            use_past_class_head=bool(getattr(config, 'use_past_class_head', 0)),
         )
     else:
         raise ValueError(f"Unknown model type: {model_type}")

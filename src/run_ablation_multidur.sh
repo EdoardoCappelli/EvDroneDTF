@@ -95,8 +95,10 @@ for DURATION in "${DUR_CONFIGS[@]}"; do
     DUR_TAG="${DURATION//,/_}"         
     RUN_NAME="ablation_multidur_${SUBTAG}${SHTAG}${MIXTAG}${DUR_TAG}"
     TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+    TIMESTAMP=20260829_102724
     RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"
     BEST_MODEL_PATH="${RUN_DIR}/checkpoints/best_model.pt"
+    BEST_MODEL_PATH="${RUN_DIR}/checkpoints/last_checkpoint.pt"
     TRAIN_LOG_FILE="${RUN_DIR}/train_${RUN_NAME}.log"
     TEST_LOG_FILE="${RUN_DIR}/test_${RUN_NAME}.log"
 
@@ -107,34 +109,34 @@ for DURATION in "${DUR_CONFIGS[@]}"; do
     mkdir -p "${RUN_DIR}"
 
     # ── TRAINING ──
-    {
-        echo "============================================================"
-        echo "  ${RUN_NAME} — Training (durate=${DURATION}, rami separati, da HF)"
-        echo "  Run dir : ${RUN_DIR}  |  Free: ${AVAIL_G}G"
-        echo "  Spie: NESSUN '[pretrained] Carico detector' (da HF) | NESSUN '[forecasting]' (T=0)"
-        echo "============================================================"
-        set +e
-        python3 -u main.py \
-            --mode train --index_path "${INDEX_PATH}" --config "${CONFIG}" \
-            --epochs "${EPOCHS}" --subsample "${TRAIN_SUBSAMPLE}" --num_workers "${NUM_WORKERS}" \
-            --train_batch_size "${TRAIN_BATCH_SIZE}" --durations "${DURATION}" \
-            --learning_rate "${LEARNING_RATE}" --weight_decay "${WEIGHT_DECAY}" --optimizer "${OPTIMIZER}" \
-            --output_dir "${RUN_DIR}" --wandb_path "${WANDB_DIR}" \
-            --phase "${PHASE}" --query_mode "${QUERY_MODE}" --num_standard_queries "${NUM_STD_QUERIES}" \
-            --use_wandb "${USE_WANDB}" --wandb_entity "${WANDB_ENTITY}" --wandb_project "${WANDB_PROJECT}" \
-            --run_name "${RUN_NAME}" --use_nms "${USE_NMS}" --use_only_annotated "${USE_ANNOTATED}" \
-            --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --seed "${SEED}" \
-            --freeze_detector "${FREEZE_DETECTOR}" --pretrained_detector_path "${PRETRAINED_DETECTOR_PATH}" \
-            --use_past_dropout "${USE_PAST_DROPOUT}" --past_dropout_p "${PAST_DROPOUT_P}" \
-            --use_fake_past "${USE_FAKE_PAST}" --fake_past_p "${FAKE_PAST_P}" \
-            --fake_max_k "${FAKE_MAX_K}" --fake_collide_thr "${FAKE_COLLIDE_THR}" \
-            --use_mixed_query_mode "${USE_MIXED_QUERY_MODE}" --p_both "${P_BOTH}" --p_past "${P_PAST}" \
-            "${ARCH_ARGS[@]}" \
-            --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
-            --persistent_workers "${PERSISTENT_WORKERS}" --vis_freq "${VIS_FREQ}"
-        echo "  Training finished — exit ${?}"
-        set -e
-    } 2>&1 | tee -a "${TRAIN_LOG_FILE}"
+    # {
+    #     echo "============================================================"
+    #     echo "  ${RUN_NAME} — Training (durate=${DURATION}, rami separati, da HF)"
+    #     echo "  Run dir : ${RUN_DIR}  |  Free: ${AVAIL_G}G"
+    #     echo "  Spie: NESSUN '[pretrained] Carico detector' (da HF) | NESSUN '[forecasting]' (T=0)"
+    #     echo "============================================================"
+    #     set +e
+    #     python3 -u main.py \
+    #         --mode train --index_path "${INDEX_PATH}" --config "${CONFIG}" \
+    #         --epochs "${EPOCHS}" --subsample "${TRAIN_SUBSAMPLE}" --num_workers "${NUM_WORKERS}" \
+    #         --train_batch_size "${TRAIN_BATCH_SIZE}" --durations "${DURATION}" \
+    #         --learning_rate "${LEARNING_RATE}" --weight_decay "${WEIGHT_DECAY}" --optimizer "${OPTIMIZER}" \
+    #         --output_dir "${RUN_DIR}" --wandb_path "${WANDB_DIR}" \
+    #         --phase "${PHASE}" --query_mode "${QUERY_MODE}" --num_standard_queries "${NUM_STD_QUERIES}" \
+    #         --use_wandb "${USE_WANDB}" --wandb_entity "${WANDB_ENTITY}" --wandb_project "${WANDB_PROJECT}" \
+    #         --run_name "${RUN_NAME}" --use_nms "${USE_NMS}" --use_only_annotated "${USE_ANNOTATED}" \
+    #         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --seed "${SEED}" \
+    #         --freeze_detector "${FREEZE_DETECTOR}" --pretrained_detector_path "${PRETRAINED_DETECTOR_PATH}" \
+    #         --use_past_dropout "${USE_PAST_DROPOUT}" --past_dropout_p "${PAST_DROPOUT_P}" \
+    #         --use_fake_past "${USE_FAKE_PAST}" --fake_past_p "${FAKE_PAST_P}" \
+    #         --fake_max_k "${FAKE_MAX_K}" --fake_collide_thr "${FAKE_COLLIDE_THR}" \
+    #         --use_mixed_query_mode "${USE_MIXED_QUERY_MODE}" --p_both "${P_BOTH}" --p_past "${P_PAST}" \
+    #         "${ARCH_ARGS[@]}" \
+    #         --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
+    #         --persistent_workers "${PERSISTENT_WORKERS}" --vis_freq "${VIS_FREQ}"
+    #     echo "  Training finished — exit ${?}"
+    #     set -e
+    # } 2>&1 | tee -a "${TRAIN_LOG_FILE}"
 
     # ── EVALUATION: solo mAP detection (both + standard_only + diag). NO forecasting, NO AR. ──
     {

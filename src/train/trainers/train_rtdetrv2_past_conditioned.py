@@ -50,6 +50,40 @@ def collide(traj, present_gt, thr=0.15):
     iou = box_iou(recent_xyxy, present_xyxy)          
     return iou.max().item() >= thr
 
+def augment_past_boxes(past_boxes, valid_mask, p, std, max_off):
+    """Perturbazione TEMPORALE-CORRELATA (random walk) delle past-box REALI, per simulare il
+    passato RUMOROSO che il modello genera da solo in autoregressive (exposure bias: in training
+    il passato è oracle, in AR è la sua stessa detrezione → mismatch che fa degradare l'AR).
+
+    past_boxes: (B, O, P, 4) cxcywh normalizzato — SOLO gli slot reali (PRIMA dei fake past).
+    valid_mask: (B, O) bool, True dove lo slot è un drone reale (non padding).
+    p:       prob. che un track valido venga perturbato (gli altri restano oracle).
+    std:     std del PASSO del random walk (frazione, unità normalizzate); 0 = no-op.
+             L'offset cumulato cresce ~ std·sqrt(P): correlato nel tempo, non i.i.d. per-frame.
+    max_off: clamp sull'offset cumulato (frazione) → niente box assurde (il "delta" necessario).
+
+    Perturba SOLO l'input: i target (present/future GT) non passano di qui. I fake past NON
+    sono toccati (sono un'altra augmentation). Train-only + gated: decide il chiamante.
+    """
+    if std <= 0.0:
+        return past_boxes
+    B, O, P, _ = past_boxes.shape
+    dev = past_boxes.device
+    sel = valid_mask & (torch.rand(B, O, device=dev) < p)              # (B,O) chi perturbare
+    if not bool(sel.any()):
+        return past_boxes
+    scale = torch.rand(B, O, 1, 1, device=dev) * std                   # magnitudine random per-track (curriculum)
+    offset = torch.cumsum(torch.randn(B, O, P, 4, device=dev) * scale, dim=2)  # random walk sull'asse temporale
+    offset = offset.clamp(-max_off, max_off)
+    p_cx, p_cy, p_w, p_h = past_boxes.unbind(-1)                       # (B,O,P) ciascuno
+    ox, oy, ow, oh = offset.unbind(-1)
+    cx = (p_cx + ox * p_w).clamp(0.0, 1.0)                             # centro spostato ∝ dimensione box
+    cy = (p_cy + oy * p_h).clamp(0.0, 1.0)
+    w  = (p_w * (1.0 + ow)).clamp(1e-3, 1.0)                           # dimensione perturbata in modo moltiplicativo
+    h  = (p_h * (1.0 + oh)).clamp(1e-3, 1.0)
+    aug = torch.stack([cx, cy, w, h], dim=-1)                          # (B,O,P,4)
+    return torch.where(sel.unsqueeze(-1).unsqueeze(-1), aug, past_boxes)
+
 def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, config=None, augment=True):
 
     durations = list(batch[0][0].keys())
@@ -70,12 +104,12 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             mode = 'standard_only'
 
     # --- Augmentation: solo train, solo phase 2, solo modalità 'both' ---
-    is_both  = (mode == 'both')
-    use_dropout = bool(augment and phase == 2 and is_both and getattr(config, "use_past_dropout", 0))
-    drop_p = getattr(config, "past_dropout_p", 0.3)
-    use_fake = bool(augment and phase == 2 and is_both and getattr(config, "use_fake_past", 0))
-    fake_p = getattr(config, "fake_past_p", 0.3)
-    fake_max_k = getattr(config, "fake_max_k", 3)
+    is_both          = (mode == 'both')
+    use_dropout      = bool(augment and phase == 2 and is_both and getattr(config, "use_past_dropout", 0))
+    drop_p           = getattr(config, "past_dropout_p", 0.3)
+    use_fake         = bool(augment and phase == 2 and is_both and getattr(config, "use_fake_past", 0))
+    fake_p           = getattr(config, "fake_past_p", 0.3)
+    fake_max_k       = getattr(config, "fake_max_k", 3)
     fake_collide_thr = getattr(config, "fake_collide_thr", 0.15)
 
     valid_batch = []  # per i droni con passato
@@ -203,6 +237,17 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             for p_idx in range(num_past):
                 past_boxes[b, drone_idx, p_idx] = id_to_past[vid][p_idx]
 
+    # --- Augmentation past-oracle (anti exposure-bias AR): random walk sulle past-box REALI ---
+    # Solo train, phase 2, gated. Perturba l'INPUT passato (i target restano oracle); i fake past,
+    # aggiunti dopo, NON sono toccati. ~past_mask = slot reali (non padding).
+    if augment and phase == 2 and getattr(config, 'use_past_aug', 0):
+        past_boxes = augment_past_boxes(
+            past_boxes, ~past_mask,
+            getattr(config, 'past_aug_p', 0.5),
+            getattr(config, 'past_aug_std', 0.05),
+            getattr(config, 'past_aug_max', 0.2),
+        )
+
     # Build future_gt (B, max_objects, T, 4) + future_mask (B, max_objects, T) — forecasting, solo query-passato
     num_future = getattr(config, "num_future_steps", 0)
     future_gt = None
@@ -263,6 +308,23 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
         for j, traj in enumerate(scelte):
             fake_boxes[b, j] = traj
             fake_valid[b, j] = True
+
+    ## Esempio:
+    ## frame 0 (2 real, 2 fake): [ real0  real1 | fake0  fake1 ]
+    ## frame 1 (1 real, 2 fake): [ real0  PAD   | fake0  fake1 ]  
+    ## Frame 2 (0 real, 2 fake): [ PAD    PAD   | fake0  fake1 ] 
+    ## Frame 3 (0 real, 2 fake): [ PAD    PAD   | fake0  not valid ] 
+
+
+    ## La maschera past_mask creata sopra va sistemata visto che ho aggiunto i fake past
+    ## Voglio che l attention vedi questi passati quindi mi serve aggiungere dei False
+    ## Non e detto che per ogni sample ci siano sempre 2 fake past, quindi la maschera non e sempre False False
+
+    ## dall esempio sopra
+    ## Frame 0:   [ F   F   |   F   F ]
+    ## Frame 1:   [ F   T   |   F   F ] 
+    ## Frame 2:   [ T   T   |   F   F ]
+    ## Frame 3:   [ T   T   |   F   T ]  
 
     ## concateno le query finte a past_boxes
     past_boxes = torch.cat([past_boxes, fake_boxes], dim=1)
@@ -330,7 +392,7 @@ class PastConditionedTrainer(BaseTrainer):
         super().__init__(config)
         self.global_step = 0   # contatore monotòno globale (asse x di wandb)
         # early-stopping: inizializzati qui così esistono anche se la 1a val NON migliora
-        # (es. in resume con best_val_loss già finito) -> niente AttributeError.
+        # (es. in resume con best_val_loss già finito) → niente AttributeError.
         self.patience = getattr(config, 'patience', 5)
         self.patience_counter = getattr(self, 'patience_counter', 0)
 
@@ -369,7 +431,7 @@ class PastConditionedTrainer(BaseTrainer):
         )
         self.val_dataset = get_dataset(
             self.config.dataset_name,
-            split='val',   # val = SEQUENZE held-out del train (seq_split) -> basta col leak "val=test"
+            split='val',   # val = SEQUENZE held-out del train (seq_split) → niente leak "val=test"
             modality=task_modality,
             config=self.config
         )
@@ -390,6 +452,8 @@ class PastConditionedTrainer(BaseTrainer):
             worker_init_fn=_seed_worker,
         )
 
+        # Validation: POCHI worker e NON persistenti → si liberano subito dopo la val.
+        # Evita l'overlap "8 train persistenti + N val" che saturava la RAM (SIGKILL in validation).
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.config.val_batch_size,
@@ -427,6 +491,8 @@ class PastConditionedTrainer(BaseTrainer):
 
         self.model = get_model(model_name, self.device, self.config)
 
+        # --- Opzionale: carica un detector pretrained (es. il tuo 84% map). ---
+        # Indipendente dal freeze: path SENZA freeze = fine-tuning; path CON freeze = frozen.
         ckpt_path = getattr(self.config, 'pretrained_detector_path', '')
         if ckpt_path:
             print(f"[pretrained] Carico detector: {ckpt_path}")
@@ -435,7 +501,7 @@ class PastConditionedTrainer(BaseTrainer):
             missing, unexpected = self.model.load_state_dict(state, strict=False)
             print(f"[pretrained] missing: {len(missing)} | unexpected: {len(unexpected)}")
 
-        # --- Opzionale: congela tutto tranne UN modulo (default past_encoder; forecasting -> forecasting_head) ---
+        # --- Opzionale: congela tutto tranne UN modulo (default past_encoder; forecasting → forecasting_head) ---
         if getattr(self.config, 'freeze_detector', 0):
             keep = getattr(self.config, 'trainable_when_frozen', 'past_encoder')
             for name, param in self.model.named_parameters():
@@ -455,7 +521,7 @@ class PastConditionedTrainer(BaseTrainer):
 
     def _setup_optimizer(self):
         """Setup optimizer for MultiDurationDetrMultiScale model."""
-        print("  Setting up optimizer for MultiDurationDetrMultiScale model...")
+        print("⚙️  Setting up optimizer for MultiDurationDetrMultiScale model...")
         import torch.optim as optim
 
         # Config is already flattened by merge_args(), access directly
@@ -516,7 +582,7 @@ class PastConditionedTrainer(BaseTrainer):
                 schedulers=[warmup_sched, cosine_sched],
                 milestones=[warmup_steps],
             )
-            print(f"[RTDetrTrainer] Scheduler: warmup ({warmup_epochs} ep) -> cosine")
+            print(f"[RTDetrTrainer] Scheduler: warmup ({warmup_epochs} ep) → cosine")
 
         elif scheduler_type == "step":
             step_size = getattr(self.config, "lr_step_size", 30) * steps_per_epoch
@@ -529,7 +595,7 @@ class PastConditionedTrainer(BaseTrainer):
                 schedulers=[warmup_sched, step_sched],
                 milestones=[warmup_steps],
             )
-            print(f"[RTDetrTrainer] Scheduler: warmup ({warmup_epochs} ep) -> step")
+            print(f"[RTDetrTrainer] Scheduler: warmup ({warmup_epochs} ep) → step")
 
         else:
             self.scheduler = warmup_sched
@@ -601,10 +667,16 @@ class PastConditionedTrainer(BaseTrainer):
                 fake_mask = fake_mask.to(device)
 
             # ── Loss UFFICIALE RT-DETR sul ramo STANDARD (encoder-loss + deep supervision + VFL) ──
+            # Ripristina ciò che il port past-conditioned aveva rimosso: senza la loss dell'encoder
+            # enc_score_head non riceve gradiente e le query standard non trovano i droni.
+            # Gira in standard_only (tutte le query standard) E in both (solo le slot [N:]);
+            # il ramo passato resta sulla loss manuale sotto. GT standard = TUTTI i droni (con +
+            # senza passato) → in both le box passato/standard si sovrappongono e la dedup avviene
+            # a inference (M4, priorità al passato). enc_topk sono già le 50 proposte → nessuno slice.
             loss_std_rtdetr = None
-            _std_ldict = None # breakdown loss RT-DETR (per il logging wandb)
+            _std_ldict = None          # breakdown loss RT-DETR (per il logging wandb)
             if phase == 2 and mode in ('standard_only', 'both'):
-                N_std = N if mode == 'both' else 0 # in both le query standard sono le slot [N:]
+                N_std = N if mode == 'both' else 0     # in both le query standard sono le slot [N:]
                 branch = self.model.primary_branch
                 std_labels = []
                 for b in range(B):
@@ -625,8 +697,10 @@ class PastConditionedTrainer(BaseTrainer):
 
             box_pred_list, box_gt_list = [], []
             cls_logits_list, cls_targets_list = [], []
-            # present-refinement dalla forecasting head (None se non attiva).
+            # Proposta C: present-refinement dalla forecasting head (None se non attiva).
             # Con use_present_refine=0 il modello ritorna present_refined = pred_boxes (grezze):
+            # NON va supervisionato (duplicherebbe la box loss) → lo trattiamo come assente
+            # così la refine-loss non viene né calcolata né sommata.
             present_refined = outputs.present_refined if getattr(self.config, 'use_present_refine', 1) else None
             refined_pred_list, refined_gt_list = [], []
             num_pos = 0
@@ -666,7 +740,7 @@ class PastConditionedTrainer(BaseTrainer):
                     if phase == 2:
                         cls_logits_list.append(logits[b, :n])
                         cls_targets_list.append(torch.ones_like(logits[b, :n]))   # foreground
-                    # present-refinement supervisionato sulla STESSA present-GT
+                    # Proposta C: present-refinement supervisionato sulla STESSA present-GT
                     if present_refined is not None:
                         refined_pred_list.append(present_refined[b, :n])
                         refined_gt_list.append(detr_labels[b]['boxes'])
@@ -681,8 +755,13 @@ class PastConditionedTrainer(BaseTrainer):
                         fake_score_sum += fake_logits.sigmoid().sum().item()
                         fake_score_cnt += fake_logits.numel()
 
+                # --- ramo STANDARD: gestito sopra da branch.loss_function (loss_std_rtdetr) ---
+                # Sia in both sia in standard_only il ramo standard usa ora la loss UFFICIALE
+                # RT-DETR (encoder + deep supervision + VFL). NON si matcha più a mano: era il
+                # match manuale (solo new_labels, senza encoder-loss) che faceva collassare lo standard.
+
             if len(box_pred_list) == 0 and len(cls_logits_list) == 0 and loss_std_rtdetr is None:
-                continue  # niente box/logits manuali E niente loss standard RT-DETR -> skippo
+                continue  # niente box/logits manuali E niente loss standard RT-DETR → skippo
 
             loss_bbox = torch.zeros((), device=device)
             loss_giou = torch.zeros((), device=device)
@@ -691,6 +770,11 @@ class PastConditionedTrainer(BaseTrainer):
                 pred_flat = torch.cat(box_pred_list, dim=0) # tot_box, 4
                 gt_flat = torch.cat(box_gt_list, dim=0) # tot_box, 4, in questo modo pred_flat[i] e gt_flat[i] sono allineati
                 loss_bbox = F.l1_loss(pred_flat, gt_flat, reduction='sum') / max(num_pos, 1) # loss di regressione sulle coordinate
+                # RIFERIMENTO (approccio precedente O(N²): matrice piena per la sola diagonale)
+                # giou_diag = generalized_box_iou(
+                #     center_to_corners_format(pred_flat),
+                #     center_to_corners_format(gt_flat),
+                # ).diag() # dalla matrice predizioni/gt prendo la diagonale ovvero le iou(pred_i, gt_i)
                 giou_diag = paired_generalized_box_iou(          # O(N): GIoU appaiato pred_i↔gt_i
                     center_to_corners_format(pred_flat),
                     center_to_corners_format(gt_flat),
@@ -704,7 +788,7 @@ class PastConditionedTrainer(BaseTrainer):
                 cls_targets = torch.cat(cls_targets_list, dim=0)
                 loss_cls = sigmoid_focal_loss(cls_logits, cls_targets, num_pos)
 
-            # ── Present-refinement: L1+GIoU present_refined↔present-GT ──
+            # ── Present-refinement (Proposta C): L1+GIoU present_refined↔present-GT ──
             loss_present_refine = torch.zeros((), device=device)
             if len(refined_pred_list) > 0:
                 rp = torch.cat(refined_pred_list, dim=0)
@@ -718,7 +802,7 @@ class PastConditionedTrainer(BaseTrainer):
                 loss_ref_giou = (1 - giou_ref).sum() / num_ref
                 loss_present_refine = loss_ref_l1 * 5.0 + loss_ref_giou * 2.0
 
-            # ── Forecasting: L1+GIoU su (query-passato, step) validi ──
+            # ── Forecasting (passo 3): L1+GIoU su (query-passato, step) validi ──
             loss_forecast = torch.zeros((), device=device)
             future_gt = batch.get('future_gt', None)
             future_boxes = outputs.future_boxes                      # (B, Q, T, 4) o None
@@ -731,13 +815,14 @@ class PastConditionedTrainer(BaseTrainer):
                     pred_sel = fp[future_mask]                       # (K, 4)
                     gt_sel   = future_gt[future_mask]                # (K, 4)
                     # Weighting progressivo per-step: i passi lontani (spostamento maggiore)
-                    # pesano di più -> contrastano l'attrattore "stay put" del forecasting.
+                    # pesano di più → contrastano l'attrattore "stay put" del forecasting.
                     # w_t = 1 + ((t+1)/T)·(w_max−1): ramp da ~1 (t=0) a w_max (t=T−1). w_max=1 ⇒ media uniforme.
                     T_fut = fp.shape[2]
                     w_max = float(getattr(self.config, 'forecast_step_weight_max', 3.0))
                     step_w = 1.0 + (torch.arange(1, T_fut + 1, device=device, dtype=fp.dtype) / T_fut) * (w_max - 1.0)
                     w = step_w.view(1, 1, T_fut).expand(fp.shape[0], M, T_fut)[future_mask]   # (K,) peso per coppia
                     w_sum = w.sum().clamp(min=1e-6)
+                    # (rif. O(N²) precedente: generalized_box_iou(...).diag(), sostituito da paired_giou)
                     l1_per   = F.l1_loss(pred_sel, gt_sel, reduction='none').sum(dim=-1)       # (K,) L1 per box
                     giou_per = 1.0 - paired_generalized_box_iou(
                         center_to_corners_format(pred_sel),
@@ -748,9 +833,12 @@ class PastConditionedTrainer(BaseTrainer):
                     loss_forecast = loss_fut_l1 * 5.0 + loss_fut_giou * 2.0
 
             fw = getattr(self.config, 'forecast_loss_weight', 1.0)
-            rw = getattr(self.config, 'present_refine_loss_weight', 1.0)   # peso del present-refinement
+            rw = getattr(self.config, 'present_refine_loss_weight', 1.0)   # peso del present-refinement (Proposta C)
             loss = (loss_bbox * 5.0 + loss_giou * 2.0 + loss_cls * 1.0
                     + loss_forecast * fw + loss_present_refine * rw)
+            # Ramo standard (loss ufficiale RT-DETR, già pesata internamente con main+aux+enc).
+            # In both convive con la loss del ramo passato: std_loss_weight bilancia i due
+            # (default 1.0; in joint può servire <1 se il ramo passato/forecasting sotto-allena).
             if loss_std_rtdetr is not None:
                 sw = getattr(self.config, 'std_loss_weight', 1.0)
                 loss = loss + loss_std_rtdetr * sw
@@ -772,7 +860,8 @@ class PastConditionedTrainer(BaseTrainer):
                     future_mask=batch.get('future_mask', None),
                 )
         
-            # Backward pass
+            # Backward pass (salta se la loss non ha gradiente:
+            # es. forecasting con detector frozen e batch senza coppie future valide)
             self.optimizer.zero_grad()
             if loss.requires_grad:
                 loss.backward()
@@ -780,9 +869,12 @@ class PastConditionedTrainer(BaseTrainer):
                 if self.scheduler is not None:
                     self.scheduler.step()
 
+            # 3.D — ogni .item() forza una sync CUDA: calcolo ciascuno scalare UNA volta e
+            # riuso il float per accumulo/wandb/pbar (prima loss.item() girava ~3×/batch).
             loss_val          = loss.item()
             loss_bbox_val     = loss_bbox.item()
             loss_giou_val     = loss_giou.item()
+            loss_cls_val      = loss_cls.item()          # phase 1: 0.0 (nessun background)
             loss_forecast_val = loss_forecast.item()
             loss_refine_val   = loss_present_refine.item()
 
@@ -798,11 +890,13 @@ class PastConditionedTrainer(BaseTrainer):
                     "train/loss_total": loss_val,
                     "train/loss_bbox": loss_bbox_val,
                     "train/loss_giou": loss_giou_val,
+                    "train/loss_cls": loss_cls_val,
                     "train/loss_forecast": loss_forecast_val,
                     "train/loss_present_refine": loss_refine_val,
                     "train/learning_rate": self.optimizer.param_groups[0]['lr'],
                 }
                 # standard_only: breakdown della loss ufficiale RT-DETR (vfl/bbox/giou + copie enc/aux).
+                # Impilo i valori e faccio UN solo .tolist() → un solo sync CUDA (non uno per chiave).
                 if _std_ldict is not None and len(_std_ldict) > 0:
                     _sk = list(_std_ldict.keys())
                     _sv = torch.stack([
@@ -904,10 +998,11 @@ class PastConditionedTrainer(BaseTrainer):
             if self.val_loader and epoch % self.config.val_epoch_freq == 0:
                 val_loss = self._validate(epoch)
                 self.val_losses.append(val_loss)
+                _selname = 'val_loc (senza cls)' if getattr(self.config, 'select_exclude_cls', 0) else 'val_loss'
 
-                # Early Stopping
+                # Early Stopping (sul metric di selezione: val_loc se select_exclude_cls=1)
                 if val_loss < self.best_val_loss:
-                    print(f"New Best Val Loss: {val_loss:.4f} (was {self.best_val_loss:.4f})")
+                    print(f"New Best [{_selname}]: {val_loss:.4f} (was {self.best_val_loss:.4f})")
                     self.best_val_loss = val_loss
                     self.patience_counter = 0  
                     self.patience = self.config.patience 
@@ -1052,6 +1147,11 @@ class PastConditionedTrainer(BaseTrainer):
                 pred_flat = torch.cat(box_pred_list, dim=0)
                 gt_flat = torch.cat(box_gt_list, dim=0)
                 loss_bbox = F.l1_loss(pred_flat, gt_flat, reduction='sum') / max(num_pos, 1)
+                # RIFERIMENTO (approccio precedente O(N²)):
+                # giou_diag = generalized_box_iou(
+                #     center_to_corners_format(pred_flat),
+                #     center_to_corners_format(gt_flat),
+                # ).diag()
                 giou_diag = paired_generalized_box_iou(
                     center_to_corners_format(pred_flat),
                     center_to_corners_format(gt_flat),
@@ -1065,7 +1165,7 @@ class PastConditionedTrainer(BaseTrainer):
                 cls_targets = torch.cat(cls_targets_list, dim=0)
                 loss_cls = sigmoid_focal_loss(cls_logits, cls_targets, num_pos)
 
-            # ── Present-refinement — stessa loss del train ──
+            # ── Present-refinement (Proposta C) — stessa loss del train ──
             loss_present_refine = torch.zeros((), device=device)
             if len(refined_pred_list) > 0:
                 rp = torch.cat(refined_pred_list, dim=0)
@@ -1079,7 +1179,7 @@ class PastConditionedTrainer(BaseTrainer):
                 loss_ref_giou = (1 - giou_ref).sum() / num_ref
                 loss_present_refine = loss_ref_l1 * 5.0 + loss_ref_giou * 2.0
 
-            # ── Forecasting: stessa loss del train, così best-model lo segue ──
+            # ── Forecasting (passo 3): stessa loss del train, così best-model lo segue ──
             loss_forecast = torch.zeros((), device=device)
             future_gt = batch.get('future_gt', None)
             future_boxes = outputs.future_boxes
@@ -1124,14 +1224,19 @@ class PastConditionedTrainer(BaseTrainer):
         num_batches = len(self.val_loader)
         n = max(num_batches, 1)
         avg_val_loss = val_loss / n
+        # val_loc = totale SENZA la cls (che sale per calibrazione e avvelena la selezione del
+        # checkpoint). La cls resta nel TRAINING; qui la togliamo SOLO dal criterio di best/early-stop
+        # se select_exclude_cls=1. val_loc = 5·bbox + 2·giou + fw·forecast + rw·refine.
+        avg_val_loc = avg_val_loss - (val_loss_cls / n)
 
         # Un solo log di validazione per epoca, allo stesso global_step del train
-        # (fine epoca): niente più campo "step" alternativo -> asse x coerente.
+        # (fine epoca): niente più campo "step" alternativo → asse x coerente.
         if self.config.use_wandb and self.run is not None:
             import wandb
             wandb.log({
                 "epoch": epoch + 1,
                 "val/loss_total": avg_val_loss,
+                "val/loss_loc": avg_val_loc,
                 "val/loss_bbox": val_loss_bbox / n,
                 "val/loss_giou": val_loss_giou / n,
                 "val/loss_cls": val_loss_cls / n,
@@ -1139,7 +1244,8 @@ class PastConditionedTrainer(BaseTrainer):
                 "val/loss_present_refine": val_loss_present_refine / n,
                 "val/learning_rate": self.optimizer.param_groups[0]['lr'],
             }, step=self.global_step)
-        return avg_val_loss
+        # metric di SELEZIONE: val_loc (senza cls) se richiesto, altrimenti il totale (default)
+        return avg_val_loc if getattr(self.config, 'select_exclude_cls', 0) else avg_val_loss
         
 
     @torch.no_grad()
@@ -1181,7 +1287,7 @@ class PastConditionedTrainer(BaseTrainer):
 
         batch_size = next(iter(frames_dict.values())).shape[0]
 
-        # Post-process using orig_size -> predicted boxes in orig_size pixel coords
+        # Post-process using orig_size → predicted boxes in orig_size pixel coords
         target_sizes = [(orig_h, orig_w)] * batch_size
         results = self.image_processor.post_process_object_detection(
             outputs,

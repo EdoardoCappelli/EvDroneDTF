@@ -5,4 +5,5 @@ visualizations/
 *.log
 *.tmp
 *.pt
-*.png
+*.png*.mp4
+__pycache__/

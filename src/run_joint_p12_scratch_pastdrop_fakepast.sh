@@ -93,7 +93,7 @@ if [ -z "${INDEX_PATH:-}" ] && [ "${SPLIT_TAG:-}" = "challenging" ]; then
 fi
 INDEX_PATH="${INDEX_PATH:-/seidenas/datasets/FRED/preprocessed/}"   # default: canonical
 echo "[split] SPLIT_TAG='${SPLIT_TAG:-<none>}'  ->  INDEX_PATH='${INDEX_PATH}'"
-RESUME_CHECKPOINT="/equilibrium/ecappelli/runs/joint_scratch_p12_pastdrop_fakepast_time_surface_20260922_224733/checkpoints/last_checkpoint.pt"          # FRESH
+RESUME_CHECKPOINT=""          # FRESH
 
 # --- EVALUATION ---
 EVAL_BATCH_SIZE=16

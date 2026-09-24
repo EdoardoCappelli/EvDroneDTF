@@ -5,5 +5,16 @@ visualizations/
 *.log
 *.tmp
 *.pt
-*.png*.mp4
+*.png
+*.mp4
 __pycache__/
+past_aug_jump_viz/
+pymp/
+repr_check/
+run_viz_past_aug.sh/
+visualize_past_aug.py
+verify_representation.py
+test_representation_formulas.py
+sweep_ar_params.py
+comparison.sh
+check_frames_finite.py

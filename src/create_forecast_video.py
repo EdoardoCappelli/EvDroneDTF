@@ -154,7 +154,7 @@ def render_forecast(
     if pred_boxes is not None and pred_boxes.shape[0] > 0:
         for box, sc in zip(pred_boxes.cpu().numpy(), scores.cpu().numpy()):
             if sc >= score_thr:
-                _draw_box(ax, box, C_PRED, img_w, img_h, lw=2.0)
+                _draw_box(ax, box, C_PRED, img_w, img_h, lw=2.0, label=f'{sc:.2f}')
 
     # Futuro GT (verde tratteggiato, fade con l'orizzonte)
     if future_gt is not None:
@@ -184,7 +184,7 @@ def render_forecast(
         handles=[
             patches.Patch(facecolor='none', edgecolor=C_PRESENT_GT, linestyle='-',  label='GT presente'),
             patches.Patch(facecolor='none', edgecolor=C_PRESENT_GT, linestyle='--', label='GT futuro'),
-            patches.Patch(facecolor='none', edgecolor=C_PRED,       linestyle='-',  label='Detection presente'),
+            patches.Patch(facecolor='none', edgecolor=C_PRED,       linestyle='-',  label='Detection presente (score)'),
             patches.Patch(facecolor='none', edgecolor=C_FORECAST,   linestyle='--', label='Forecast futuro'),
             patches.Patch(facecolor='none', edgecolor=C_TRACK_USED, linestyle='--', label='Past usato (valido)'),
             patches.Patch(facecolor='none', edgecolor=C_PAST_GT,    linestyle='--', label='Track non valido'),

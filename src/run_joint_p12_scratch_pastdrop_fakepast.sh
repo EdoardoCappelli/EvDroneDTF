@@ -12,7 +12,7 @@ set -euo pipefail
 CONFIG="RTDetrPastConditioned"
 EPOCHS=${EPOCHS:-20}          # env: EPOCHS=40 ./run_... per il test "train longer"
 TRAIN_BATCH_SIZE=16
-NUM_WORKERS=8
+NUM_WORKERS=4
 DURATION=${DURATION:-33,165,330}
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-5
@@ -93,7 +93,7 @@ if [ -z "${INDEX_PATH:-}" ] && [ "${SPLIT_TAG:-}" = "challenging" ]; then
 fi
 INDEX_PATH="${INDEX_PATH:-/seidenas/datasets/FRED/preprocessed/}"   # default: canonical
 echo "[split] SPLIT_TAG='${SPLIT_TAG:-<none>}'  ->  INDEX_PATH='${INDEX_PATH}'"
-RESUME_CHECKPOINT=""          # FRESH
+RESUME_CHECKPOINT="/equilibrium/ecappelli/runs/joint_scratch_p12_pastdrop_fakepast_time_surface_20260922_224733/checkpoints/last_checkpoint.pt"          # FRESH
 
 # --- EVALUATION ---
 EVAL_BATCH_SIZE=16
@@ -106,10 +106,10 @@ AR_STD_BOX_PRIORITY=${STDBOX:-0}   # env: STDBOX=1 → merge-fix (box standard v
 AR_CONF_THR=${AR_CONF:-0.65}       # soglia score detection CORRENTE del tracker AR (default config 0.35; qui tarato 0.65). env: AR_CONF=0.5 ./run_...
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"   # FRESH: nuova RUN_DIR ogni lancio
-TIMESTAMP=20260920_155201
 RUNS_DIR="/equilibrium/ecappelli/runs"
 RUN_DIR="${RUNS_DIR}/${RUN_NAME}_${TIMESTAMP}"
 BEST_MODEL_PATH="${RUN_DIR}/checkpoints/best_model.pt"
+BEST_MODEL_PATH="${RUN_DIR}/checkpoints/last_checkpoint.pt"
 TRAIN_LOG_FILE="${RUN_DIR}/train_${RUN_NAME}.log"
 TEST_LOG_FILE="${RUN_DIR}/test_${RUN_NAME}.log"
 
@@ -135,49 +135,49 @@ ARCH_ARGS=(
 )
 
 # ── TRAINING ──
-# {
-#     echo "============================================================"
-#     echo "  ${RUN_NAME} — Training (JOINT det+forecast, P=12, past_dropout+fake_past)"
-#     echo "  Run dir : ${RUN_DIR}  |  Free: ${AVAIL_G}G su /equilibrium"
-#     echo "  Attesi nel log: NESSUN '[pretrained] Carico detector' (da HF) | '[forecasting] head = transformer'"
-#     echo "  Spia fix: wandb train/std_loss_*_enc deve SCENDERE (enc_score_head impara)"
-#     echo "============================================================"
-#     set +e
-#     RESUME_ARGS=()
-#     if [ -n "${RESUME_CHECKPOINT}" ]; then
-#         if [ -f "${RESUME_CHECKPOINT}" ]; then
-#             echo "   Resume da: ${RESUME_CHECKPOINT}"
-#             RESUME_ARGS+=(--resume_from_checkpoint "${RESUME_CHECKPOINT}")
-#         else
-#             echo "⚠️  RESUME_CHECKPOINT non trovato: ${RESUME_CHECKPOINT} — parto da zero."
-#         fi
-#     fi
-#     python3 -u main.py \
-#         --mode train --index_path "${INDEX_PATH}" --config "${CONFIG}" \
-#         --epochs "${EPOCHS}" --subsample "${TRAIN_SUBSAMPLE}" --num_workers "${NUM_WORKERS}" \
-#         --train_batch_size "${TRAIN_BATCH_SIZE}" --durations "${DURATION}" \
-#         --learning_rate "${LEARNING_RATE}" --weight_decay "${WEIGHT_DECAY}" --optimizer "${OPTIMIZER}" \
-#         --output_dir "${RUN_DIR}" --wandb_path "${WANDB_DIR}" \
-#         --phase "${PHASE}" --query_mode "${QUERY_MODE}" --num_standard_queries "${NUM_STD_QUERIES}" \
-#         --use_wandb "${USE_WANDB}" --wandb_entity "${WANDB_ENTITY}" --wandb_project "${WANDB_PROJECT}" \
-#         --run_name "${RUN_NAME}" --use_nms "${USE_NMS}" --use_only_annotated "${USE_ANNOTATED}" \
-#         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --seed "${SEED}" \
-#         --freeze_detector "${FREEZE_DETECTOR}" --pretrained_detector_path "${PRETRAINED_DETECTOR_PATH}" \
-#         --use_past_dropout "${USE_PAST_DROPOUT}" --past_dropout_p "${PAST_DROPOUT_P}" \
-#         --use_fake_past "${USE_FAKE_PAST}" --fake_past_p "${FAKE_PAST_P}" \
-#         --fake_max_k "${FAKE_MAX_K}" --fake_collide_thr "${FAKE_COLLIDE_THR}" \
-#         --use_mixed_query_mode "${USE_MIXED_QUERY_MODE}" --p_both "${P_BOTH}" --p_past "${P_PAST}" \
-#         --forecast_loss_weight "${FORECAST_LOSS_WEIGHT}" --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
-#         --std_loss_weight "${STD_LOSS_WEIGHT}" \
-#         --select_exclude_cls "${SELECT_NO_CLS}" \
-#         --use_past_aug "${USE_PAST_AUG}" --past_aug_std "${PAST_AUG_STD}" \
-#         "${ARCH_ARGS[@]}" \
-#         "${RESUME_ARGS[@]}" \
-#         --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
-#         --persistent_workers "${PERSISTENT_WORKERS}" --vis_freq "${VIS_FREQ}"
-#     echo "  Training finished — exit ${?}"
-#     set -e
-# } 2>&1 | tee -a "${TRAIN_LOG_FILE}"
+{
+    echo "============================================================"
+    echo "  ${RUN_NAME} — Training (JOINT det+forecast, P=12, past_dropout+fake_past)"
+    echo "  Run dir : ${RUN_DIR}  |  Free: ${AVAIL_G}G su /equilibrium"
+    echo "  Attesi nel log: NESSUN '[pretrained] Carico detector' (da HF) | '[forecasting] head = transformer'"
+    echo "  Spia fix: wandb train/std_loss_*_enc deve SCENDERE (enc_score_head impara)"
+    echo "============================================================"
+    set +e
+    RESUME_ARGS=()
+    if [ -n "${RESUME_CHECKPOINT}" ]; then
+        if [ -f "${RESUME_CHECKPOINT}" ]; then
+            echo "   Resume da: ${RESUME_CHECKPOINT}"
+            RESUME_ARGS+=(--resume_from_checkpoint "${RESUME_CHECKPOINT}")
+        else
+            echo "⚠️  RESUME_CHECKPOINT non trovato: ${RESUME_CHECKPOINT} — parto da zero."
+        fi
+    fi
+    python3 -u main.py \
+        --mode train --index_path "${INDEX_PATH}" --config "${CONFIG}" \
+        --epochs "${EPOCHS}" --subsample "${TRAIN_SUBSAMPLE}" --num_workers "${NUM_WORKERS}" \
+        --train_batch_size "${TRAIN_BATCH_SIZE}" --durations "${DURATION}" \
+        --learning_rate "${LEARNING_RATE}" --weight_decay "${WEIGHT_DECAY}" --optimizer "${OPTIMIZER}" \
+        --output_dir "${RUN_DIR}" --wandb_path "${WANDB_DIR}" \
+        --phase "${PHASE}" --query_mode "${QUERY_MODE}" --num_standard_queries "${NUM_STD_QUERIES}" \
+        --use_wandb "${USE_WANDB}" --wandb_entity "${WANDB_ENTITY}" --wandb_project "${WANDB_PROJECT}" \
+        --run_name "${RUN_NAME}" --use_nms "${USE_NMS}" --use_only_annotated "${USE_ANNOTATED}" \
+        --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --seed "${SEED}" \
+        --freeze_detector "${FREEZE_DETECTOR}" --pretrained_detector_path "${PRETRAINED_DETECTOR_PATH}" \
+        --use_past_dropout "${USE_PAST_DROPOUT}" --past_dropout_p "${PAST_DROPOUT_P}" \
+        --use_fake_past "${USE_FAKE_PAST}" --fake_past_p "${FAKE_PAST_P}" \
+        --fake_max_k "${FAKE_MAX_K}" --fake_collide_thr "${FAKE_COLLIDE_THR}" \
+        --use_mixed_query_mode "${USE_MIXED_QUERY_MODE}" --p_both "${P_BOTH}" --p_past "${P_PAST}" \
+        --forecast_loss_weight "${FORECAST_LOSS_WEIGHT}" --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
+        --std_loss_weight "${STD_LOSS_WEIGHT}" \
+        --select_exclude_cls "${SELECT_NO_CLS}" \
+        --use_past_aug "${USE_PAST_AUG}" --past_aug_std "${PAST_AUG_STD}" \
+        "${ARCH_ARGS[@]}" \
+        "${RESUME_ARGS[@]}" \
+        --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
+        --persistent_workers "${PERSISTENT_WORKERS}" --vis_freq "${VIS_FREQ}"
+    echo "  Training finished — exit ${?}"
+    set -e
+} 2>&1 | tee -a "${TRAIN_LOG_FILE}"
 
 # ── EVALUATION: mAP (both + standard_only + diag) → ADE/FDE → tracking AR ──
 {
@@ -191,20 +191,20 @@ ARCH_ARGS=(
     set +e
 
     # 1) mAP detection: both e standard_only (standard_only = cold-start AR). diag = localizzazione.
-    # for QM in both standard_only; do
-    #     echo "── DETECTION mAP (oracle) — query_mode=${QM} ──"
-    #     python3 -u main.py \
-    #         --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
-    #         --checkpoint_path "${BEST_MODEL_PATH}" --test_batch_size "${EVAL_BATCH_SIZE}" \
-    #         --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample "${EVAL_SUBSAMPLE}" \
-    #         --index_path "${INDEX_PATH}/" --phase "${PHASE}" --query_mode "${QM}" \
-    #         --num_standard_queries "${NUM_STD_QUERIES}" "${ARCH_ARGS[@]}" \
-    #         --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
-    #         --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
-    #         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
-    #         --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0 \
-    #         --diag_best_iou 1
-    # done
+    for QM in both standard_only; do
+        echo "── DETECTION mAP (oracle) — query_mode=${QM} ──"
+        python3 -u main.py \
+            --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
+            --checkpoint_path "${BEST_MODEL_PATH}" --test_batch_size "${EVAL_BATCH_SIZE}" \
+            --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample "${EVAL_SUBSAMPLE}" \
+            --index_path "${INDEX_PATH}/" --phase "${PHASE}" --query_mode "${QM}" \
+            --num_standard_queries "${NUM_STD_QUERIES}" "${ARCH_ARGS[@]}" \
+            --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
+            --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
+            --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
+            --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 0 \
+            --diag_best_iou 1
+    done
 
     # 2) Forecasting ADE/FDE (EF=1, sulle query-passato)
     echo "── FORECASTING ADE/FDE (--eval_forecasting 1) ──"
@@ -220,19 +220,19 @@ ARCH_ARGS=(
         --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 1 --autoregressive 0
 
     # 3) TRACKING autoregressivo closed-loop (passato = predizioni del modello; + export MOT + motmetrics)
-    # echo "── TRACKING AR closed-loop (--ar_oracle_past 0, merge-fix std_box_priority=${AR_STD_BOX_PRIORITY}) ──"
-    # python3 -u main.py \
-    #     --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
-    #     --checkpoint_path "${BEST_MODEL_PATH}" --test_batch_size "${EVAL_BATCH_SIZE}" \
-    #     --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample 1 \
-    #     --index_path "${INDEX_PATH}/" --phase "${PHASE}" --query_mode both \
-    #     --num_standard_queries "${NUM_STD_QUERIES}" "${ARCH_ARGS[@]}" \
-    #     --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
-    #     --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
-    #     --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
-    #     --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 1 \
-    #     --ar_oracle_past 0 --ar_export_mot 1 --ar_std_box_priority "${AR_STD_BOX_PRIORITY}" \
-    #     --ar_conf_thr "${AR_CONF_THR}"
+    echo "── TRACKING AR closed-loop (--ar_oracle_past 0, merge-fix std_box_priority=${AR_STD_BOX_PRIORITY}) ──"
+    python3 -u main.py \
+        --config "${CONFIG}" --mode eval --evaluator_type "${EVALUATOR_TYPE}" \
+        --checkpoint_path "${BEST_MODEL_PATH}" --test_batch_size "${EVAL_BATCH_SIZE}" \
+        --durations "${DURATION}" --output_dir "${RUN_DIR}" --subsample 1 \
+        --index_path "${INDEX_PATH}/" --phase "${PHASE}" --query_mode both \
+        --num_standard_queries "${NUM_STD_QUERIES}" "${ARCH_ARGS[@]}" \
+        --use_cv_anchor "${USE_CV_ANCHOR}" --vel_avg_k "${VEL_AVG_K}" \
+        --processor_threshold_eval "${EVAL_PROCESSOR_TH}" --use_only_annotated "${EVAL_USE_ANNOTATED}" \
+        --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
+        --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 1 \
+        --ar_oracle_past 0 --ar_export_mot 1 --ar_std_box_priority "${AR_STD_BOX_PRIORITY}" \
+        --ar_conf_thr "${AR_CONF_THR}"
 
     set -e
     echo "  Evaluation finished"

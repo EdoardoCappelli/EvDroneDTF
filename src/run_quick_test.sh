@@ -17,6 +17,8 @@ fi
 CHECKPOINT=$(realpath "$1")
 OUTPUT_DIR=${2:-"quick_test_$(basename "${CHECKPOINT%.pt}")"}
 MINI_INDEX=${FRED_MINI_INDEX_PATH:-/media/becattini/SSD4TB/datasets/FRED/preprocessed_ar_mini}
+# The dataset loader appends the index filename directly to index_path.
+MINI_INDEX="${MINI_INDEX%/}/"
 PYTHON_BIN=${PYTHON_BIN:-python3}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -24,8 +26,8 @@ if [[ ! -f "$CHECKPOINT" ]]; then
     echo "Checkpoint not found: $CHECKPOINT" >&2
     exit 1
 fi
-if [[ ! -f "$MINI_INDEX/test_windows_33ms.json" ]]; then
-    echo "FRED canonical mini-test index not found: $MINI_INDEX/test_windows_33ms.json" >&2
+if [[ ! -f "${MINI_INDEX}test_windows_33ms.json" ]]; then
+    echo "FRED canonical mini-test index not found: ${MINI_INDEX}test_windows_33ms.json" >&2
     exit 1
 fi
 

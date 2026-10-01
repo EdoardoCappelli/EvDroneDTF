@@ -11,6 +11,7 @@ from tqdm import tqdm
 from utils.data_utils import _apply_nms
 from collections import deque
 from scipy.optimize import linear_sum_assignment
+from torchvision.ops import box_convert, nms
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1159,8 +1160,24 @@ class PastConditionedEvaluator(BaseEvaluator):
 
             # ── Update ───────────────────────────────────────────────────────────
             N = past_boxes.shape[1]
-            past_b = pred_boxes[:N].cpu().numpy(); past_s = scores[:N].cpu().numpy()
-            std_b  = pred_boxes[N:].cpu().numpy(); std_s  = scores[N:].cpu().numpy()
+            past_boxes_out, past_scores_out = pred_boxes[:N], scores[:N]
+            std_boxes_out, std_scores_out = pred_boxes[N:], scores[N:]
+
+            # Suppress duplicate standard queries before track association. Applying
+            # NMS after this point would be too late: duplicates may already have
+            # spawned separate tracks. Past queries stay untouched because they have
+            # a one-to-one correspondence with the valid input tracks.
+            if self.config.use_nms and std_boxes_out.shape[0] > 0:
+                std_keep = nms(
+                    box_convert(std_boxes_out, in_fmt="cxcywh", out_fmt="xyxy"),
+                    std_scores_out,
+                    iou_threshold=self.config.nms_threshold,
+                )
+                std_boxes_out = std_boxes_out[std_keep]
+                std_scores_out = std_scores_out[std_keep]
+
+            past_b = past_boxes_out.cpu().numpy(); past_s = past_scores_out.cpu().numpy()
+            std_b = std_boxes_out.cpu().numpy(); std_s = std_scores_out.cpu().numpy()
 
             updated = set()
             current_dets = []   # (box cxcywh np, score, track_id) — l'ID serve alle metriche di tracking

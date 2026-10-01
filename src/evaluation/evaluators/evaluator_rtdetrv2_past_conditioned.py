@@ -119,6 +119,32 @@ def best_match_track(tracks, box, iou_thr, dist_thr, exclude):
 # METRICHE DI TRACKING  (CLEAR-MOT + IDF1)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def match_tracks_global(tracks, detections, iou_thr, dist_thr, exclude=None):
+    """Globally match detections to tracks with gated Hungarian assignment."""
+    exclude = exclude or set()
+    candidates = [t for t in tracks if t not in exclude]
+    if not candidates or not detections:
+        return {}
+
+    invalid_cost = 1e6
+    cost = np.full((len(candidates), len(detections)), invalid_cost, dtype=np.float32)
+    for ti, track in enumerate(candidates):
+        reference = track.predicted_next
+        for di, box in enumerate(detections):
+            iou = box_iou_cxcywh(reference, box)
+            dist = box_center_dist(reference, box)
+            if iou > iou_thr or dist < dist_thr:
+                dist_norm = min(dist / max(dist_thr, 1e-8), 1.0)
+                cost[ti, di] = 0.7 * (1.0 - iou) + 0.3 * dist_norm
+
+    rows, cols = linear_sum_assignment(cost)
+    return {
+        int(di): candidates[int(ti)]
+        for ti, di in zip(rows, cols)
+        if cost[ti, di] < invalid_cost
+    }
+
+
 class TrackingMetrics:
     """
     MOTA / MOTP / IDF1 / ID-switch sulle identità prodotte dal tracker autoregressivo
@@ -1206,25 +1232,37 @@ class PastConditionedEvaluator(BaseEvaluator):
                 # sulla detection, tracking mantenuto dal passato.
                 past_out = {t: (b, float(s)) for t, b, s in zip(valid, past_b, past_s)}
                 std_for_track = {}
-                # 1) STANDARD prima: associa a un track esistente o spawn (una standard per track)
-                for i in np.argsort(-std_s):
-                    if std_s[i] <= conf_thr:
-                        break
+                # 1) Match all standard detections jointly. Greedy score-order
+                # association can give a track to the wrong detection at crossings.
+                std_indices = [int(i) for i in np.argsort(-std_s) if std_s[i] > conf_thr]
+                std_boxes_active = [std_b[i] for i in std_indices]
+                local_matches = match_tracks_global(
+                    tracks, std_boxes_active, iou_thr, dist_thr, exclude=updated,
+                )
+                matched_indices = set()
+                for local_i, track in local_matches.items():
+                    i = std_indices[local_i]
+                    std_for_track[track] = (std_b[i], float(std_s[i]))
+                    updated.add(track)
+                    matched_indices.add(i)
+
+                # Unmatched detections either recover a valid past track or spawn.
+                for i in std_indices:
+                    if i in matched_indices:
+                        continue
                     b, s = std_b[i], float(std_s[i])
-                    m = best_match_track(tracks, b, iou_thr, dist_thr, exclude=updated)
-                    if m is not None:
-                        std_for_track[m] = (b, s); updated.add(m)
+                    hit = next((t for t in valid if t not in updated
+                                and past_out.get(t, (None, 0.0))[1] > conf_thr
+                                and box_iou_cxcywh(b, past_out[t][0]) >= std_past_iou_thr), None)
+                    if hit is not None:
+                        std_for_track[hit] = (b, s)
+                        updated.add(hit)
                     else:
-                        # anti-duplicato: se ricalca la box-passato di un track valido (assoc. fallita)
-                        # non spawno un doppione → assegno la standard a quel track (vince comunque)
-                        hit = next((t for t in valid if t not in updated
-                                    and past_out.get(t, (None, 0.0))[1] > conf_thr
-                                    and box_iou_cxcywh(b, past_out[t][0]) >= std_past_iou_thr), None)
-                        if hit is not None:
-                            std_for_track[hit] = (b, s); updated.add(hit)
-                        else:
-                            nt = Track(b, s, P); tracks.append(nt); updated.add(nt)
-                            current_dets.append((b, s, nt.track_id)); current_dets_src.append('standard')
+                        nt = Track(b, s, P)
+                        tracks.append(nt)
+                        updated.add(nt)
+                        current_dets.append((b, s, nt.track_id))
+                        current_dets_src.append('standard')
                 # 2) EMISSIONE per i track esistenti: box standard se c'è, altrimenti il passato (buco)
                 for t in tracks:
                     if t in std_for_track:

@@ -386,6 +386,7 @@ class BaseTrainer(ABC):
             'best_val_loss': self.best_val_loss,
             'global_step': getattr(self, 'global_step', 0),
             'patience_counter': getattr(self, 'patience_counter', 0),
+            'self_past_state': getattr(self, 'self_past_state', None),   # rampa del training curriculum
         }
         if getattr(self, 'scheduler', None) is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
@@ -475,6 +476,8 @@ class BaseTrainer(ABC):
         self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         self.global_step = checkpoint.get('global_step', 0)
         self.patience_counter = checkpoint.get('patience_counter', 0)
+        if checkpoint.get('self_past_state') is not None:
+            self.self_past_state = checkpoint['self_past_state']
 
         # Ripristino dello scheduler (LR). Se il checkpoint non lo contiene (versione
         # vecchia), fast-forward al punto di ripresa così l'LR è coerente.

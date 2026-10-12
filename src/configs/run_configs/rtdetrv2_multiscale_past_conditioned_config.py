@@ -33,6 +33,52 @@ class DefaultArgs(BaseConfig):
             'past_aug_p': 0.5,     # prob. che un track valido venga perturbato (gli altri restano oracle)
             'past_aug_std': 0.05,  # std del passo del random walk (frazione); CALIBRARE sull'errore AR misurato (AR oracle vs self)
             'past_aug_max': 0.2,   # clamp sull'offset cumulato (frazione) → niente box assurde
+            # --- Rumore REALISTICO sul passato (anti exposure-bias AR): AR(1) stazionario sulla finestra ---
+            # Calibrato sull'errore delle box del tracker vs GT misurato su FRED reale (2026-10-07).
+            # A differenza di use_past_aug (random walk che parte da ~0) perturba allo stesso modo anche
+            # la box più recente, che è il punto di riferimento della query-passato.
+            'use_past_noise': 0,     # 1 = rumore realistico sulle past-box reali (solo train, phase 2)
+            'past_noise_p': 0.5,     # prob. che un track venga perturbato (gli altri restano oracle)
+            'past_noise_sx': 0.13,   # std errore del centro x, in frazioni della larghezza
+            'past_noise_sy': 0.10,   # std errore del centro y, in frazioni dell'altezza
+            'past_noise_sw': 0.22,   # std errore relativo della larghezza
+            'past_noise_sh': 0.16,   # std errore relativo dell'altezza
+            'past_noise_rho': 0.87,  # autocorrelazione dell'errore fra frame consecutivi
+            'past_noise_max': 0.6,   # clamp dell'errore (frazione della box)
+            # --- Passato di un drone che SPARISCE: finestre reali di droni assenti ora → negativi (sfondo) ---
+            # In training ogni query-passato reale aveva un drone sotto ("query ⇒ drone presente"); in AR il
+            # tracker manda query anche per droni appena usciti. Trattati come i fake past (solo both).
+            'use_vanish_past': 0,    # 1 = aggiungi le finestre dei droni che spariscono come negativi
+            'vanish_past_p': 1.0,    # prob. di usare ciascuna finestra disponibile
+            'vanish_max_gap': 6,     # frame di assenza coperti (box mancanti estrapolate come fa il tracker)
+            'vanish_keep_empty': 1,  # 1 = tieni anche i frame senza droni (prima scartati dal collate)
+            'vanish_future_check': 1,  # 1 = scarta i droni che ricompaiono nelle annotazioni future (buchi di GT, occlusioni)
+            'vanish_border': 0.0,    # >0 = solo uscite dall'inquadratura (ultima box entro questa distanza normalizzata dal bordo)
+            # --- Training curriculum: passato CLOSED-LOOP prodotto dal modello (train/closed_loop_cache.py) ---
+            # Ogni self_past_refresh epoche (dopo self_past_warmup) il modello corrente gira in eval, in closed
+            # loop con lo STESSO tracker dell'inferenza (parametri ar_* sotto, testing_args), su una frazione
+            # delle sequenze di training; con probabilità p un frame di training usa quelle finestre al posto
+            # del passato GT. I target restano GT (finestre senza drone → sfondo). p segue self_past_schedule,
+            # con la qualità misurata sul VAL (q = IoU medio finestra↔GT; mAP50 del closed loop):
+            #   ramp:        p sale di self_past_step a ogni epoca in cui q ≥ self_past_q_min
+            #   product_iou: p = max(q, self_past_floor) · epoca/epoche
+            #   product_map: p = max(mAP50, self_past_floor) · epoca/epoche     (sempre ≤ self_past_p_max)
+            'use_self_past': 0,          # 1 = training curriculum con il passato closed-loop (solo train, phase 2, both)
+            'self_past_schedule': 'ramp',  # 'ramp' | 'product_iou' | 'product_map'
+            'self_past_floor': 0.0,      # product_*: minimo del fattore di qualità (0.5 = max(map_val, 0.5) della formula di Gabriele)
+            'self_past_warmup': 4,       # epoche di solo passato GT prima del primo rollout
+            'self_past_refresh': 1,      # rollout ogni N epoche
+            'self_past_aggregate': 1,    # 1 = la cache si accumula fra i rollout (le sequenze rifatte si aggiornano, le
+                                         #     altre restano): esposizione effettiva ≈ p·(frame in cache), che cresce
+                                         #     epoca dopo epoca anche con self_past_subset piccolo (stile DAgger)
+            'self_past_subset': 0.3,     # frazione delle sequenze di training per rollout (a caso, ogni volta diverse)
+            'self_past_val_subset': 0.5, # frazione delle sequenze di val su cui misurare q
+            'self_past_q_min': 0.6,      # soglia di qualità per far salire p
+            'self_past_step': 0.05,      # incremento di p per epoca (finché q ≥ q_min)
+            'self_past_p_max': 0.8,      # tetto di p: resta sempre almeno il 20% di passato GT
+            'self_past_match_iou': 0.1,  # IoU minima ancora↔drone per assegnare il target (sotto → sfondo)
+            'self_past_workers': 4,      # worker del DataLoader del rollout
+            'self_past_max_frames': 0,   # debug: massimo frame per sequenza nel rollout (0 = tutti)
             # --- Mixed query-mode training (un detector per tutte le modalità) ---
             'use_mixed_query_mode': 0,   # 1 = randomizza la query-mode per batch in training
             'p_both': 0.6,               # prob. modalità 'both'
@@ -82,10 +128,16 @@ class DefaultArgs(BaseConfig):
             'ar_seq_offset': 0,       # sfasa la selezione delle sequenze: offset/stride disgiunti → tuning vs report separati
             'ar_export_mot': 0,       # 1 = scrive i track in formato MOTChallenge (mot_tracks/{pred,gt}) per eval_tracker.py
             'ar_oracle_past': 0,      # 1 = pass di tracking ORACLE: passato = GT (limite superiore). ID sempre dal tracker
+            'ar_tracker': 'legacy',   # 'legacy' = tracker storico | 'tracktrack' = TrackTrack-AR (TPA + TAI, CVPR 2025): evaluation/tracktrack_ar.py
             # --- Diagnostico soglia-free: localizzazione vs calibrazione del ramo standard ---
             'diag_best_iou': 0,       # 1 = in evaluate() stampa best-IoU per GT su TUTTE le pred (nessuna soglia score)
             'diag_fp_source': 0,      # 1 = in AR decompone gli FP per ramo di provenienza ('past' vs 'standard'). SOLO misura, zero cambio di comportamento
         })
+        # Parametri di TrackTrack-AR come chiavi 'ar_tt_<nome>' (override da CLI: --ar_tt_min_hits 3 ...).
+        # I default vivono in TTConfig (evaluation/tracktrack_ar.py): una sola fonte, niente doppioni.
+        from evaluation.tracktrack_ar import TTConfig
+        from dataclasses import fields as _fields
+        self.testing_args.update({f'ar_tt_{f.name}': f.default for f in _fields(TTConfig)})
         self.model_args = {
             'model_name': 'rtdetrv2_past_conditioned',
         }

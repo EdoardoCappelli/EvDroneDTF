@@ -10,234 +10,116 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.data_utils import _apply_nms
 from collections import deque
-from scipy.optimize import linear_sum_assignment
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TRACKER AUTOREGRESSIVO  (ripreso da create_detection_video.py)
+# TRACKER AUTOREGRESSIVO: primitive + LegacyTracker in evaluation/closed_loop.py
+# (condivise con il rollout del training curriculum). 
 # ══════════════════════════════════════════════════════════════════════════════
-
-def box_iou_cxcywh(a, b):
-    """IoU tra due box (4,) cxcywh normalizzate."""
-    ax1, ay1, ax2, ay2 = a[0]-a[2]/2, a[1]-a[3]/2, a[0]+a[2]/2, a[1]+a[3]/2
-    bx1, by1, bx2, by2 = b[0]-b[2]/2, b[1]-b[3]/2, b[0]+b[2]/2, b[1]+b[3]/2
-    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
-    inter = iw * ih
-    union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
-    return inter / union if union > 0 else 0.0
-
-
-def box_center_dist(a, b):
-    """Distanza euclidea normalizzata tra i centri di due box cxcywh."""
-    return float(np.sqrt((a[0]-b[0])**2 + (a[1]-b[1])**2))
-
-
-class Track:
-    """Finestra scorrevole delle ultime P box predette dal modello (indice 0 = più vecchio)."""
-
-    _next_id = 0   # contatore globale: ogni track nuova riceve un ID univoco e mai riusato
-
-    def __init__(self, box, score, P):
-        Track._next_id += 1
-        self.track_id = Track._next_id   # identità del tracker (serve per MOTA/IDF1/ID-switch)
-        self.boxes = deque([box], maxlen=P)
-        self.scores = deque([score], maxlen=P)
-        self.missed = 0
-        # Proposta C: box t+1 predetta dalla forecasting head al frame precedente
-        # (None finché il track non è stato dato come query-passato con head attiva).
-        self.forecast_next = None
-
-    def update(self, box, score):
-        self.boxes.append(box)
-        self.scores.append(score)
-        self.missed = 0
-
-    @property
-    def last(self):
-        return self.boxes[-1]
-
-    @property
-    def predicted_next(self):
-        """Posizione stimata al frame corrente per l'associazione.
-
-        Proposta C: preferisce la predizione APPRESA dalla forecasting head (t+1 calcolata
-        al frame precedente); fallback su estrapolazione lineare se non disponibile.
-        """
-        if self.forecast_next is not None:
-            return np.clip(self.forecast_next, 0.0, 1.0)
-        if len(self.boxes) < 2:
-            return self.last
-        velocity = self.boxes[-1] - self.boxes[-2]
-        return np.clip(self.last + velocity, 0.0, 1.0)
-
-    def is_valid(self, P, mean_conf_thr, coher_thr):
-        """Valido (inviabile come past) se finestra piena, conf MEDIA alta, box coerenti.
-        NB: mean_conf_thr è la soglia sulla MEDIA della finestra — distinta da conf_thr, che
-        è la soglia di accettazione della detection CORRENTE (nel loop di update)."""
-        if len(self.boxes) < P:
-            return False
-        if float(np.mean(self.scores)) < mean_conf_thr:
-            return False
-        bs = list(self.boxes)
-        return all(box_iou_cxcywh(a, b) >= coher_thr for a, b in zip(bs[:-1], bs[1:]))
-
-    def trajectory_recent_first(self, P):
-        """(P, 4) con indice 0 = più recente — formato atteso dal modello."""
-        return np.stack(list(self.boxes)[::-1], axis=0)
-
-
-def best_match_track(tracks, box, iou_thr, dist_thr, exclude):
-    """Track migliore per una detection: IoU su predicted_next (STRETTAMENTE sopra iou_thr),
-    poi fallback su distanza centri (sotto dist_thr)."""
-    # FIX: era 'v >= best_iou' con best_iou = iou_thr = 0.0. Poiché box_iou_cxcywh >= 0,
-    # la condizione era SEMPRE vera → qualunque detection veniva agganciata a un track
-    # (all'ultimo della lista, a IoU nulla) e il fallback su distanza restava codice morto.
-    # Con '>' una box a IoU 0 (o pari a iou_thr) non aggancia, e il fallback torna vivo.
-    best_iou, best_iou_track = iou_thr, None
-    for t in tracks:
-        if t in exclude:
-            continue
-        v = box_iou_cxcywh(t.predicted_next, box)
-        if v > best_iou:
-            best_iou, best_iou_track = v, t
-    if best_iou_track is not None:
-        return best_iou_track
-
-    best_dist, best_dist_track = dist_thr, None
-    for t in tracks:
-        if t in exclude:
-            continue
-        d = box_center_dist(t.predicted_next, box)
-        if d < best_dist:
-            best_dist, best_dist_track = d, t
-    return best_dist_track
+from evaluation.closed_loop import (   # noqa: F401
+    box_iou_cxcywh, box_center_dist, Track, best_match_track, nms_std, duplicate_tracks, LegacyTracker,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# METRICHE DI TRACKING  (CLEAR-MOT + IDF1)
+# METRICHE DI TRACKING  (motmetrics: CLEAR-MOT + IDF1)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TrackingMetrics:
     """
     MOTA / MOTP / IDF1 / ID-switch sulle identità prodotte dal tracker autoregressivo
     (`Track.track_id`) confrontate con gli ID di traccia della GT (`target['ids']`).
-
-    Implementazione diretta (motmetrics NON è tra le dipendenze del progetto), secondo
-    le definizioni standard:
-      MOTA = 1 − (FN + FP + IDSW) / GT          [CLEAR-MOT, Bernardin & Stiefelhagen]
-      MOTP = IoU medio delle coppie matchate
-      IDF1 = 2·IDTP / (2·IDTP + IDFP + IDFN)    [Ristani et al.] — richiede un matching
-             identità-livello GLOBALE sulla sequenza, non per-frame.
-
-    Accumula PER-SEQUENZA e aggrega: gli ID GT si ripetono tra video diversi, quindi
-    matchare identità attraverso i confini di sequenza sarebbe scorretto.
     """
 
-    def __init__(self, iou_thr=0.5):
+    def __init__(self, iou_thr=0.5, img_w=1280, img_h=720):
+        try:
+            import motmetrics as mm
+        except ImportError as e:
+            raise ImportError("Le metriche di tracking usano motmetrics: pip install motmetrics") from e
+        # Compat NumPy 2.0: motmetrics chiama np.asfarray (rimosso in NumPy 2.0). Stesso shim di eval_tracker.py.
+        if not hasattr(np, 'asfarray'):
+            np.asfarray = lambda a, dtype=np.float64: np.asarray(a, dtype=dtype)
+        self.mm = mm
         self.iou_thr = float(iou_thr)
-        # aggregati globali
-        self.gt_total = 0
-        self.fp = 0
-        self.fn = 0
-        self.idsw = 0
-        self.matched = 0
-        self.iou_sum = 0.0
-        self.idtp = 0
-        self.idfp = 0
-        self.idfn = 0
-        self.n_seq = 0
-        self._start_seq()
+        self.img_w, self.img_h = img_w, img_h
+        self._accs = {}       # nome sequenza -> [MOTAccumulator, ultimo frameid]
+        self._cur = None
+        self.summary = None   # DataFrame per-sequenza + OVERALL, riempito da compute()
 
-    def _start_seq(self):
-        self._prev = {}      # gt_id -> pred_id dell'ultimo match (persistente nella sequenza)
-        self._cooc = {}      # (gt_id, pred_id) -> n. frame in cui sono stati matchati
-        self._seq_gt = 0     # detection GT totali nella sequenza
-        self._seq_pred = 0   # detection predette totali nella sequenza
-        self._seq_used = False
+    def new_sequence(self, name=None):
+        """Da chiamare al cambio di video. Un nome già visto riprende la propria sequenza
+        (come l'export MOT, che appende allo stesso file)."""
+        if name is None:
+            name = f"seq_{len(self._accs):04d}"
+        if name not in self._accs:
+            self._accs[name] = [self.mm.MOTAccumulator(auto_id=False), 0]
+        self._cur = name
 
-    def new_sequence(self):
-        """Da chiamare al cambio di video: chiude la sequenza corrente e ne apre una nuova."""
-        self.finalize()
-        self._start_seq()
+    def mot_tlwh(self, box):
+        """cxcywh normalizzata → [left, top, w, h] in pixel, arrotondati come nei file MOT."""
+        cx, cy, bw, bh = (float(v) for v in box)
+        W, H = self.img_w, self.img_h
+        return [float(f"{v:.2f}") for v in ((cx - bw / 2) * W, (cy - bh / 2) * H, bw * W, bh * H)]
 
     def update(self, gt_ids, gt_boxes, pred_ids, pred_boxes):
-        """
-        Un frame. boxes: array (N, 4) cxcywh normalizzate; ids: sequenze di interi.
-        Matching per-frame ottimo (Hungarian su IoU) con soglia iou_thr.
-        """
-        n_gt, n_pr = len(gt_ids), len(pred_ids)
-        self._seq_used = True
-        self.gt_total += n_gt
-        self._seq_gt += n_gt
-        self._seq_pred += n_pr
-
-        if n_gt == 0 or n_pr == 0:
-            self.fp += n_pr
-            self.fn += n_gt
-            return
-
-        iou = np.zeros((n_gt, n_pr), dtype=np.float64)
-        for i in range(n_gt):
-            for j in range(n_pr):
-                iou[i, j] = box_iou_cxcywh(gt_boxes[i], pred_boxes[j])
-
-        rows, cols = linear_sum_assignment(-iou)
-        pairs = [(r, c) for r, c in zip(rows, cols) if iou[r, c] >= self.iou_thr]
-
-        for r, c in pairs:
-            g, p = int(gt_ids[r]), int(pred_ids[c])
-            self.matched += 1
-            self.iou_sum += float(iou[r, c])
-            self._cooc[(g, p)] = self._cooc.get((g, p), 0) + 1
-            # ID switch: questo GT era associato a un'altra identità predetta
-            if g in self._prev and self._prev[g] != p:
-                self.idsw += 1
-            self._prev[g] = p
-
-        self.fp += n_pr - len(pairs)
-        self.fn += n_gt - len(pairs)
-
-    def finalize(self):
-        """Chiude la sequenza: IDF1 richiede il matching identità-livello globale (Hungarian
-        sulla matrice di co-occorrenza gt_id × pred_id). Idempotente."""
-        if not self._seq_used:
-            return
-        self.n_seq += 1
-        if self._cooc:
-            gts = sorted({g for g, _ in self._cooc})
-            prs = sorted({p for _, p in self._cooc})
-            gi = {g: i for i, g in enumerate(gts)}
-            pi = {p: i for i, p in enumerate(prs)}
-            C = np.zeros((len(gts), len(prs)), dtype=np.float64)
-            for (g, p), n in self._cooc.items():
-                C[gi[g], pi[p]] = n
-            r, c = linear_sum_assignment(-C)
-            idtp = int(C[r, c].sum())
+        """Un frame. boxes: (N, 4) cxcywh normalizzate; ids: sequenze di interi."""
+        if self._cur is None:
+            self.new_sequence()
+        acc_frame = self._accs[self._cur]
+        acc_frame[1] += 1
+        gt = [self.mot_tlwh(b) for b in gt_boxes]
+        pr = [self.mot_tlwh(b) for b in pred_boxes]
+        if gt and pr:
+            # distanza = 1 − IoU; NaN (coppia vietata) se IoU < iou_thr
+            dist = self.mm.distances.iou_matrix(gt, pr, max_iou=1.0 - self.iou_thr)
         else:
-            idtp = 0
-        self.idtp += idtp
-        self.idfn += self._seq_gt - idtp
-        self.idfp += self._seq_pred - idtp
-        self._seq_used = False   # idempotenza
+            dist = np.empty((len(gt), len(pr)))
+        acc_frame[0].update([int(i) for i in gt_ids], [int(i) for i in pred_ids], dist,
+                            frameid=acc_frame[1])
 
     def compute(self):
-        self.finalize()
-        gt = max(self.gt_total, 1)
-        den_idf1 = 2 * self.idtp + self.idfp + self.idfn
+        """Riga OVERALL di motmetrics: conteggi sommati su tutte le sequenze."""
+        names = list(self._accs)
+        if names:
+            self.summary = self.mm.metrics.create().compute_many(
+                [self._accs[n][0] for n in names], names=names,
+                metrics=self.mm.metrics.motchallenge_metrics + ['num_objects', 'num_detections'],
+                generate_overall=True,
+            )
+            ov = self.summary.loc['OVERALL']
+        else:
+            self.summary = None
+            ov = {k: float('nan') for k in ('mota', 'motp', 'idf1', 'idp', 'idr', 'precision', 'recall')}
+            ov.update({k: 0 for k in ('num_switches', 'num_fragmentations', 'mostly_tracked',
+                                      'partially_tracked', 'mostly_lost', 'num_detections',
+                                      'num_false_positives', 'num_misses', 'num_objects',
+                                      'num_unique_objects')})
         return {
-            'mota':        1.0 - (self.fn + self.fp + self.idsw) / gt,
-            'motp_iou':    self.iou_sum / max(self.matched, 1),
-            'idf1':        (2.0 * self.idtp / den_idf1) if den_idf1 > 0 else 0.0,
-            'id_switches': self.idsw,
-            'track_tp':    self.matched,
-            'track_fp':    self.fp,
-            'track_fn':    self.fn,
-            'track_precision': self.matched / max(self.matched + self.fp, 1),
-            'track_recall':    self.matched / gt,
-            'gt_total':    self.gt_total,
-            'num_sequences': self.n_seq,
+            'mota':        float(ov['mota']),
+            'motp_iou':    1.0 - float(ov['motp']),   # motmetrics: distanza media 1 − IoU
+            'idf1':        float(ov['idf1']),
+            'idp':         float(ov['idp']),
+            'idr':         float(ov['idr']),
+            'id_switches': int(ov['num_switches']),
+            'num_fragmentations': int(ov['num_fragmentations']),
+            'mostly_tracked':     int(ov['mostly_tracked']),
+            'partially_tracked':  int(ov['partially_tracked']),
+            'mostly_lost':        int(ov['mostly_lost']),
+            'track_tp':    int(ov['num_detections']),   # match + switch
+            'track_fp':    int(ov['num_false_positives']),
+            'track_fn':    int(ov['num_misses']),
+            'track_precision': float(ov['precision']),
+            'track_recall':    float(ov['recall']),
+            'gt_total':    int(ov['num_objects']),
+            'num_unique_objects': int(ov['num_unique_objects']),
+            'num_sequences': len(names),
         }
+
+    def render(self):
+        """Tabella per sequenza + OVERALL in formato MOTChallenge (dopo compute())."""
+        mm = self.mm
+        return mm.io.render_summary(self.summary, formatters=mm.metrics.create().formatters,
+                                    namemap=mm.io.motchallenge_metric_names)
 
 
 def collate_autoregressive(batch, image_processor, num_past=None):
@@ -628,6 +510,17 @@ class PastConditionedEvaluator(BaseEvaluator):
                 query_mode=query_mode,
             )
 
+            # Slot di PADDING delle query-passato (past_mask=True: campioni con meno droni del
+            # massimo del batch). Il modello produce comunque una predizione per quegli slot (box
+            # vicino all'angolo (0,0), score mai supervisionato in training) e il post-process di
+            # HF tiene TUTTE le query → FP extra e mAP dipendente dalla composizione del batch.
+            # Logit −inf → score 0 → esclusi dalla soglia (> map_score_thr) del post-process.
+            if (phase == 1 or query_mode in ('both', 'past_only')) and past_mask.any():
+                n_past = past_boxes.shape[1]   # slot passato = [0:N] (in 'both' le standard sono [N:])
+                logits = outputs.logits.clone()
+                logits[:, :n_past] = logits[:, :n_past].masked_fill(past_mask.unsqueeze(-1), float('-inf'))
+                outputs.logits = logits
+
             # ---- DEBUG Test 2: punteggi grezzi delle query (collasso vs sotto-allenamento) ----
             # max≈0 → testa collassata a background | max alto ma 0 match → box mal localizzate.
             # TOGLIERE dopo la diagnosi.
@@ -961,7 +854,7 @@ class PastConditionedEvaluator(BaseEvaluator):
 
     @torch.no_grad()
     def evaluate_autoregressive(self):
-        from torchvision.ops import box_iou
+        from torchvision.ops import box_iou, nms
         """
         Eval closed-loop: il passato NON viene dalla GT ma dalle predizioni del modello.
         Stateful, sequenziale, batch=1. I track persistono tra frame e si resettano al
@@ -970,11 +863,12 @@ class PastConditionedEvaluator(BaseEvaluator):
         """
         self.model.eval()
         self.metric = MeanAveragePrecision(iou_type='bbox')
-        self.metric_fullpr = MeanAveragePrecision(iou_type='bbox')   # mAP FULL-PR (tutti gli output, soglia 0) → fair vs standard/both
+        self.metric_fullpr = MeanAveragePrecision(iou_type='bbox')   # mAP FULL-PR (tutti gli output, soglia ~0 + NMS come evaluate()) → fair vs standard/both
 
         # ── Parametri ────────────────────────────────────────────────────────────
         iou_thr_eval = getattr(self.config, 'eval_iou_threshold', 0.5)
         tp_score_thr = getattr(self.config, 'tp_score_threshold', 0.5)
+        map_score_thr = getattr(self.config, 'map_score_threshold', 0.0)   # come evaluate(): curva PR completa
         W = getattr(self.config, 'img_width', 1280)
         H = getattr(self.config, 'img_height', 720)
         P = getattr(self.config, 'num_past_steps',
@@ -995,6 +889,9 @@ class PastConditionedEvaluator(BaseEvaluator):
         # piazzata da una query-passato viene scartata → niente track duplicati sullo stesso
         # drone. Guardia presente in create_detection_video.py:674, persa nel port.
         std_past_iou_thr = getattr(self.config, 'ar_std_past_iou_thr', 0.3)
+        # NMS del tracker (stessa soglia della NMS di evaluate()): standard doppie scartate prima
+        # dell'associazione + mai due track sullo stesso drone (resta il più vecchio).
+        nms_thr = getattr(self.config, 'nms_threshold', 0.45)
         # Proposta C (opzionale, default OFF): usa il forecast appreso t+1 come reference
         # point della query-passato del frame successivo (rimpiazza la box più recente).
         use_fc_ref = bool(getattr(self.config, 'ar_use_forecast_refpoint', 0))
@@ -1002,6 +899,23 @@ class PastConditionedEvaluator(BaseEvaluator):
         #    in AR sono le predizioni del modello (closed-loop). In ENTRAMBI i casi gli ID li
         #    assegna il tracker per associazione (ID-switch informativi). ──
         oracle = bool(getattr(self.config, 'ar_oracle_past', 0))
+        # ── Tracker: 'legacy' (lo storico, con le correzioni) | 'tracktrack' (TPA + TAI di TrackTrack,
+        #    CVPR 2025, adattato alle query-passato e al forecast: evaluation/tracktrack_ar.py) ──
+        tracker_type = str(getattr(self.config, 'ar_tracker', 'legacy')).lower()
+        use_tt = tracker_type == 'tracktrack'
+        if tracker_type not in ('legacy', 'tracktrack'):
+            raise ValueError(f"ar_tracker sconosciuto: {tracker_type!r} (legacy | tracktrack)")
+        if use_tt and oracle:
+            raise ValueError("ar_tracker='tracktrack' non supporta ar_oracle_past=1: usa il tracker legacy")
+        if use_tt:
+            from evaluation.tracktrack_ar import TrackTrackAR, TTConfig
+            tt_cfg = TTConfig.from_config(self.config)
+            tt = TrackTrackAR(tt_cfg, P)
+        # Tracker legacy (evaluation/closed_loop.py): stesso codice del rollout del training curriculum
+        tracker = LegacyTracker(P, conf_thr=conf_thr, mean_conf_thr=mean_conf_thr, coher_thr=coher_thr,
+                                iou_thr=iou_thr, dist_thr=dist_thr, max_missed=max_missed,
+                                std_past_iou_thr=std_past_iou_thr, nms_thr=nms_thr,
+                                std_box_priority=std_box_priority, use_fc_ref=use_fc_ref, oracle=oracle)
 
         # ── Loader batch=1 sequenziale ───────────────────────────────────────────
         dataset = self.test_dataset
@@ -1056,8 +970,8 @@ class PastConditionedEvaluator(BaseEvaluator):
         total_tp = total_fp = total_fn = 0
         tracks = []
         prev_seq = None
-        # Metriche di tracking sulle identità del tracker vs ID di traccia GT
-        track_metrics = TrackingMetrics(iou_thr=iou_thr_eval)
+        # Metriche di tracking sulle identità del tracker vs ID di traccia GT (motmetrics)
+        track_metrics = TrackingMetrics(iou_thr=iou_thr_eval, img_w=W, img_h=H)
 
         # ── DIAGNOSTICA: quanto spesso il modello riceve davvero delle past query? ──
         # Se i track non superano is_valid, past_boxes resta vuoto → il modello gira con
@@ -1065,7 +979,8 @@ class PastConditionedEvaluator(BaseEvaluator):
         # QUALE delle tre condizioni di is_valid sta bloccando (finestra / confidenza /
         # coerenza IoU fra box consecutive), così si sa dove intervenire.
         diag = {'frames': 0, 'with_valid': 0, 'no_tracks': 0, 'tracks_but_none_valid': 0,
-                'valid_sum': 0, 'fail_len': 0, 'fail_conf': 0, 'fail_coher': 0}
+                'valid_sum': 0, 'fail_len': 0, 'fail_conf': 0, 'fail_coher': 0,
+                'std_nms': 0, 'dup_tracks': 0}   # standard scartate dalla NMS / track doppioni eliminati
 
         # ── DIAGNOSTICA FP-BY-SOURCE (solo misura, default OFF: config.diag_fp_source) ──
         # Decompone gli FP GIÀ riportati (a tp_score_thr) per RAMO di provenienza: 'past' = box
@@ -1078,14 +993,15 @@ class PastConditionedEvaluator(BaseEvaluator):
         fp_src   = {'past': 0, 'standard': 0}   # di quelle, NON matchate (= FP) → il numero chiave
 
         # ── Export MOTChallenge per eval_tracker.py (motmetrics, impl. di riferimento) ──
-        # Un .txt per sequenza in mot_tracks/{pred,gt}/, box in pixel left,top,w,h. Disaccoppia
-        # la metrica di tracking: la ricalcoli offline con l'impl. validata invece di affidarti
-        # solo alla TrackingMetrics interna. gt/ e pred/ hanno nomi-file identici → matchano.
+        # Un .txt per sequenza in mot_tracks/{pred,gt}/, box in pixel left,top,w,h: servono a
+        # ricalcolare offline le stesse metriche di TrackingMetrics (anch'essa motmetrics).
+        # gt/ e pred/ hanno nomi-file identici → matchano.
         export_mot = bool(getattr(self.config, 'ar_export_mot', 0))
-        _mot_sub = 'mot_tracks_oracle' if oracle else 'mot_tracks'   # non sovrascrivere l'altra pass
+        _mot_sub = ('mot_tracks_oracle' if oracle else
+                    'mot_tracks_tracktrack' if use_tt else 'mot_tracks')   # non sovrascrivere le altre pass
         mot_pred, mot_gt, mot_frame = {}, {}, {}
-        # seq_id → nome-file UNIVOCO. Il basename dell'hdf5 collide fra scene diverse (su FRED
-        # sono tutti uguali) → senza questo tutte le sequenze finirebbero in un file solo.
+        # seq_id → nome UNIVOCO (accumulatore motmetrics e file MOT). Il basename dell'hdf5
+        # collide fra scene diverse (su FRED sono tutti uguali) → servono nomi propri.
         seq_name_map = {}
         if export_mot:
             mot_pred_dir = os.path.join(self.output_dir, _mot_sub, 'pred')
@@ -1105,9 +1021,15 @@ class PastConditionedEvaluator(BaseEvaluator):
         for idx, batch in enumerate(tqdm(loader, desc="Autoreg inference")):
             # ── Confine di sequenza → reset tracker (e chiusura sequenza metriche) ──
             seq_id = windows[idx]['hdf5_path']
+            if seq_id not in seq_name_map:
+                seq_name_map[seq_id] = f"seq_{len(seq_name_map):04d}"
+            seq_name = seq_name_map[seq_id]   # stesso nome per l'accumulatore motmetrics e il file MOT
             if seq_id != prev_seq:
                 tracks = []
-                track_metrics.new_sequence()
+                tracker.reset()
+                if use_tt:
+                    tt.reset()
+                track_metrics.new_sequence(seq_name)
                 prev_seq = seq_id
 
             frames_dict, present_labels, present_ids, future_gt, future_ids, gt_past, gt_mask = batch
@@ -1120,32 +1042,34 @@ class PastConditionedEvaluator(BaseEvaluator):
                 valid = None
                 past_boxes = gt_past.to(self.device)
                 past_mask  = gt_mask.to(self.device)
-            else:
-                # AR closed-loop: il passato sono le predizioni dei track validi.
-                valid = [t for t in tracks if t.is_valid(P, mean_conf_thr, coher_thr)]
+            elif use_tt:
+                # TrackTrack-AR: query-passato = track confermati (anche persi da pochi frame, con la
+                # finestra completata dalle box previste)
+                valid = tt.query_tracks()
                 diag['valid_sum'] += len(valid)
                 if valid:
                     diag['with_valid'] += 1
-                elif not tracks:
+                elif not tt.tracks:
+                    diag['no_tracks'] += 1
+                else:
+                    diag['tracks_but_none_valid'] += 1
+                    for r, n in tt.query_breakdown().items():
+                        diag[r] = diag.get(r, 0) + n
+                past_boxes = torch.from_numpy(tt.query_array(valid)).float().unsqueeze(0).to(self.device)
+                past_mask = torch.zeros(1, past_boxes.shape[1], dtype=torch.bool, device=self.device)
+            else:
+                # AR closed-loop: il passato sono le predizioni dei track validi (LegacyTracker).
+                valid = tracker.query_tracks()
+                diag['valid_sum'] += len(valid)
+                if valid:
+                    diag['with_valid'] += 1
+                elif not tracker.tracks:
                     diag['no_tracks'] += 1              # nessun track: problema di detection
                 else:
                     diag['tracks_but_none_valid'] += 1  # track esistono ma il gate li rifiuta
-                    for t in tracks:
+                    for t in tracker.tracks:
                         diag[_why_invalid(t)] += 1
-
-                if valid:
-                    trajs = []
-                    for t in valid:
-                        traj = t.trajectory_recent_first(P)          # (P, 4), indice 0 = più recente
-                        if use_fc_ref and t.forecast_next is not None:
-                            # reference point = forecast appreso (stima del presente dal frame prima)
-                            traj = traj.copy()
-                            traj[0] = np.clip(t.forecast_next, 0.0, 1.0)
-                        trajs.append(traj)
-                    pb = np.stack(trajs, axis=0)
-                    past_boxes = torch.from_numpy(pb).float().unsqueeze(0).to(self.device)
-                else:
-                    past_boxes = torch.zeros(1, 0, P, 4, device=self.device)
+                past_boxes = torch.from_numpy(tracker.query_array(valid)).float().unsqueeze(0).to(self.device)
                 past_mask = torch.zeros(1, past_boxes.shape[1], dtype=torch.bool, device=self.device)
 
             outputs = self._ar_forward(frames_dict, past_boxes, past_mask)
@@ -1161,114 +1085,24 @@ class PastConditionedEvaluator(BaseEvaluator):
             N = past_boxes.shape[1]
             past_b = pred_boxes[:N].cpu().numpy(); past_s = scores[:N].cpu().numpy()
             std_b  = pred_boxes[N:].cpu().numpy(); std_s  = scores[N:].cpu().numpy()
-
-            updated = set()
-            current_dets = []   # (box cxcywh np, score, track_id) — l'ID serve alle metriche di tracking
-            current_dets_src = []  # 'past'|'standard' per ogni det, parallelo a current_dets (diag_fp_source; sola misura)
-            past_det_boxes = []  # M4: box piazzate dalle query-passato (priorità sulle standard)
-
-            if oracle:
-                # ORACLE: le past-query sono condizionate sul passato GT. Non c'è mapping
-                # 1-a-1 track↔query (il passato non viene dai track) → le tratto come detection
-                # ad ALTA priorità e le associo ai track. Gli ID restano assegnati dal tracker.
-                for i in np.argsort(-past_s):
-                    if past_s[i] <= conf_thr:
-                        break
-                    b, s = past_b[i], float(past_s[i])
-                    m = best_match_track(tracks, b, iou_thr, dist_thr, exclude=updated)
-                    if m is not None:
-                        m.update(b, s); updated.add(m); tid = m.track_id
-                    else:
-                        nt = Track(b, s, P); tracks.append(nt); updated.add(nt); tid = nt.track_id
-                    current_dets.append((b, s, tid))
-                    current_dets_src.append('past')
-                    past_det_boxes.append(b)
-            elif std_box_priority:
-                # MERGE-FIX: la box STANDARD vince (più fresca, letta dall'immagine); il passato
-                # RIEMPIE i buchi (droni che lo standard manca) e dà l'IDENTITÀ. → AR >= standard
-                # sulla detection, tracking mantenuto dal passato.
-                past_out = {t: (b, float(s)) for t, b, s in zip(valid, past_b, past_s)}
-                std_for_track = {}
-                # 1) STANDARD prima: associa a un track esistente o spawn (una standard per track)
-                for i in np.argsort(-std_s):
-                    if std_s[i] <= conf_thr:
-                        break
-                    b, s = std_b[i], float(std_s[i])
-                    m = best_match_track(tracks, b, iou_thr, dist_thr, exclude=updated)
-                    if m is not None:
-                        std_for_track[m] = (b, s); updated.add(m)
-                    else:
-                        # anti-duplicato: se ricalca la box-passato di un track valido (assoc. fallita)
-                        # non spawno un doppione → assegno la standard a quel track (vince comunque)
-                        hit = next((t for t in valid if t not in updated
-                                    and past_out.get(t, (None, 0.0))[1] > conf_thr
-                                    and box_iou_cxcywh(b, past_out[t][0]) >= std_past_iou_thr), None)
-                        if hit is not None:
-                            std_for_track[hit] = (b, s); updated.add(hit)
-                        else:
-                            nt = Track(b, s, P); tracks.append(nt); updated.add(nt)
-                            current_dets.append((b, s, nt.track_id)); current_dets_src.append('standard')
-                # 2) EMISSIONE per i track esistenti: box standard se c'è, altrimenti il passato (buco)
-                for t in tracks:
-                    if t in std_for_track:
-                        b, s = std_for_track[t]; t.update(b, s)
-                        current_dets.append((b, s, t.track_id)); current_dets_src.append('standard')
-                    elif past_out.get(t, (None, 0.0))[1] > conf_thr:
-                        b, s = past_out[t]; t.update(b, float(s)); updated.add(t)
-                        current_dets.append((b, float(s), t.track_id)); current_dets_src.append('past')
-                    # else: non emesso questo frame → missed lo incrementa il loop di aging sotto
+            if use_tt:
+                fut = (outputs.future_boxes[0, :N].detach().cpu().numpy()
+                       if outputs.future_boxes is not None and N > 0 else None)
+                emb_p = emb_s = None
+                if tt_cfg.w_app > 0 and getattr(outputs, 'hidden_states', None) is not None:
+                    hs = outputs.hidden_states[0].detach().float().cpu().numpy()
+                    emb_p, emb_s = hs[:N], hs[N:]
+                current_dets, current_dets_src = tt.step(past_b, past_s, std_b, std_s, valid, fut, emb_p, emb_s)
+                tracks = tt.tracks          # per le visualizzazioni (stessa interfaccia: .boxes)
             else:
-                # AR: ogni track valido è aggiornato dalla SUA predizione past (1-a-1)
-                for t, b, s in zip(valid, past_b, past_s):
-                    if s > conf_thr:
-                        t.update(b, float(s)); updated.add(t)
-                        current_dets.append((b, float(s), t.track_id))
-                        current_dets_src.append('past')
-                        past_det_boxes.append(b)
-                    else:
-                        t.missed += 1
-
-            # detection standard → associa (eredita l'ID) o crea un nuovo track (nuovo ID)
-            # (oracle e AR-current; con std_box_priority lo standard è già gestito sopra)
-            if not std_box_priority:
-                for i in np.argsort(-std_s):
-                    if std_s[i] <= conf_thr:
-                        break
-                    b, s = std_b[i], float(std_s[i])
-                    # M4: scarto la standard se ricalca una box già piazzata da una query-passato
-                    if any(box_iou_cxcywh(b, pbx) >= std_past_iou_thr for pbx in past_det_boxes):
-                        continue
-                    m = best_match_track(tracks, b, iou_thr, dist_thr, exclude=updated)
-                    if m is not None:
-                        m.update(b, s); updated.add(m)
-                        current_dets.append((b, s, m.track_id))
-                        current_dets_src.append('standard')
-                    else:
-                        nt = Track(b, s, P); tracks.append(nt); updated.add(nt)
-                        current_dets.append((b, s, nt.track_id))
-                        current_dets_src.append('standard')
-
-            # invecchiamento + eliminazione track morti
-            for t in tracks:
-                if t not in updated:
-                    t.missed += 1
-            tracks = [t for t in tracks if t.missed < max_missed]
-
-            # ── Proposta C: memorizza il forecast t+1 (appreso) per i track validi ──
-            # future_boxes[0, i, 0] è la box t+1 del track valid[i] (stesso ordine delle
-            # query-passato). Verrà usata come predicted_next all'associazione del frame dopo.
-            # I track NON validi in questo frame azzerano forecast_next (evita di riusare una
-            # predizione stantìa → predicted_next torna all'estrapolazione lineare).
-            # In oracle non c'è mapping track↔query (il passato è GT) → si salta: predicted_next
-            # resta l'estrapolazione lineare (forecast_next None).
-            if not oracle:
-                if outputs.future_boxes is not None and N > 0:
-                    fc_next = outputs.future_boxes[0, :N, 0].detach().cpu().numpy()   # (N, 4)
-                    fc_map = {id(t): fb for t, fb in zip(valid, fc_next)}
-                else:
-                    fc_map = {}
-                for t in tracks:
-                    t.forecast_next = fc_map.get(id(t), None)
+                # Update del tracker legacy (evaluation/closed_loop.py :: LegacyTracker.step).
+                # fc_next: forecast t+1 appreso dei track validi (Proposta C); in oracle non serve.
+                fc_next = (outputs.future_boxes[0, :N, 0].detach().cpu().numpy()
+                           if (not oracle and outputs.future_boxes is not None and N > 0) else None)
+                current_dets, current_dets_src, _st = tracker.step(past_b, past_s, std_b, std_s, valid, fc_next)
+                diag['std_nms'] += _st['std_nms']
+                diag['dup_tracks'] += _st['dup_tracks']
+                tracks = tracker.tracks
 
             # ── Visualizzazione (ogni vis_every_n_batches frame) ─────────────────
             if idx % getattr(self.config, 'vis_every_n_batches', 200) == 0:
@@ -1298,22 +1132,18 @@ class PastConditionedEvaluator(BaseEvaluator):
             # ── Export MOTChallenge del frame: cxcywh norm → pixel left,top,w,h ──
             # Stesso contatore di frame (fno) per pred e GT → allineati. Un file per sequenza.
             if export_mot:
-                # Nome-file univoco per sequenza (il basename collide fra scene → 1 file solo).
-                if seq_id not in seq_name_map:
-                    seq_name_map[seq_id] = f"seq_{len(seq_name_map):04d}"
-                seq_name = seq_name_map[seq_id]
+                # seq_name: nome-file univoco per sequenza (il basename collide fra scene → 1 file solo).
+                # Coordinate da mot_tlwh → identiche a quelle date a motmetrics in track_metrics.
                 fno = mot_frame.get(seq_name, 0) + 1
                 mot_frame[seq_name] = fno
                 pred_l = mot_pred.setdefault(seq_name, [])
                 for b, s, tid in current_dets:
-                    cx, cy, bw, bh = (float(v) for v in b)
-                    pred_l.append(f"{fno},{int(tid)},{(cx-bw/2)*W:.2f},{(cy-bh/2)*H:.2f},"
-                                  f"{bw*W:.2f},{bh*H:.2f},{float(s):.4f},-1,-1,-1")
+                    x, y, w, h = track_metrics.mot_tlwh(b)
+                    pred_l.append(f"{fno},{int(tid)},{x:.2f},{y:.2f},{w:.2f},{h:.2f},{float(s):.4f},-1,-1,-1")
                 gt_l = mot_gt.setdefault(seq_name, [])
                 for i in range(n_pair):
-                    cx, cy, bw, bh = (float(v) for v in gt_boxes_norm[i])
-                    gt_l.append(f"{fno},{int(gt_ids_np[i])},{(cx-bw/2)*W:.2f},{(cy-bh/2)*H:.2f},"
-                                f"{bw*W:.2f},{bh*H:.2f},1,-1,-1,-1")
+                    x, y, w, h = track_metrics.mot_tlwh(gt_boxes_norm[i])
+                    gt_l.append(f"{fno},{int(gt_ids_np[i])},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1,-1,-1,-1")
 
             # ── Metrica: current_dets (predizioni) vs droni presenti (GT) ────────
             if current_dets:
@@ -1334,11 +1164,18 @@ class PastConditionedEvaluator(BaseEvaluator):
                 [{'boxes': gt_boxes_xyxy, 'labels': gt_labels}],
             )
 
-            # mAP FULL-PR (fair vs standard/both): TUTTI gli output grezzi del modello
-            # (past+standard, NESSUNA soglia), come evaluate(). Confrontabile con standard_only.
+            # mAP FULL-PR (fair vs standard/both): TUTTI gli output del modello (past+standard)
+            # trattati come in evaluate(): soglia map_score_threshold (~0, curva PR completa) e la
+            # stessa NMS (use_nms / nms_threshold). Senza NMS una past e una standard sullo stesso
+            # drone contavano TP + FP → full-PR pessimista rispetto alle colonne Standard/Both.
             if pred_boxes.shape[0] > 0:
                 _allb = to_xyxy_pix(pred_boxes.detach().cpu())
                 _alls = scores.detach().cpu().reshape(-1)
+                _k = _alls > map_score_thr
+                _allb, _alls = _allb[_k], _alls[_k]
+                if self.config.use_nms and _alls.numel() > 0:
+                    _keep = nms(_allb.float(), _alls.float(), self.config.nms_threshold)
+                    _allb, _alls = _allb[_keep], _alls[_keep]
             else:
                 _allb, _alls = torch.zeros(0, 4), torch.zeros(0)
             self.metric_fullpr.update(
@@ -1385,11 +1222,11 @@ class PastConditionedEvaluator(BaseEvaluator):
         print("\nComputing final mAP score (autoregressive)...")
         final_results = self.metric.compute()
         final_fullpr = self.metric_fullpr.compute()   # mAP FULL-PR (fair vs standard/both)
-        tm = track_metrics.compute()   # chiude anche l'ultima sequenza
+        tm = track_metrics.compute()   # motmetrics, riga OVERALL su tutte le sequenze
 
         # ── mAP: due letture (confrontabile vs operating-point) ──────────────────
         _mp = lambda d, k: float(d[k]) if k in d else float('nan')
-        print("\n  mAP AR FULL-PR (tutti gli output, soglia 0 → confrontabile con standard/both):")
+        print("\n  mAP AR FULL-PR (tutti gli output, soglia ~0 + NMS come evaluate() → confrontabile con standard/both):")
         print(f"    map={_mp(final_fullpr,'map'):.4f}  map50={_mp(final_fullpr,'map_50'):.4f}  map75={_mp(final_fullpr,'map_75'):.4f}")
         print("  mAP AR system (solo current_dets > conf_thr → punto operativo del tracker):")
         print(f"    map={_mp(final_results,'map'):.4f}  map50={_mp(final_results,'map_50'):.4f}  map75={_mp(final_results,'map_75'):.4f}")
@@ -1402,12 +1239,14 @@ class PastConditionedEvaluator(BaseEvaluator):
         f1 = (2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0)
 
         print("\n" + "=" * 50)
-        _mode_str = "AUTOREGRESSIVE (oracle-past)" if oracle else "AUTOREGRESSIVE (closed-loop)"
+        _mode_str = ("AUTOREGRESSIVE (oracle-past)" if oracle else
+                     "AUTOREGRESSIVE (closed-loop, TrackTrack-AR)" if use_tt else "AUTOREGRESSIVE (closed-loop)")
         print(f"  MODE                       : {_mode_str}")
         print(f"  IoU threshold per TP/FP/FN : {iou_thr_eval}")
         print(f"  conf_thr / mean_conf_thr   : {conf_thr} / {mean_conf_thr}   (detection corrente / media finestra)")
         print(f"  tp_score_thr               : {tp_score_thr}")
         print(f"  P / max_missed             : {P} / {max_missed}")
+        print(f"  NMS tracker (IoU)          : {nms_thr}   (standard doppie + track doppioni)")
         print("-" * 50)
         print(f"  True  Positives (TP) : {total_tp}")
         print(f"  False Positives (FP) : {total_fp}")
@@ -1424,13 +1263,16 @@ class PastConditionedEvaluator(BaseEvaluator):
                 print(f"  {s:8s} : emesse={emit_src[s]}  TP={tp_src[s]}  "
                       f"FP={fp_src[s]}  ({100*fp_src[s]/tot_fp_s:.1f}% degli FP)")
             print("-" * 50)
-        print("  TRACKING (identità del tracker vs ID di traccia GT)")
+        print("  TRACKING — motmetrics, riga OVERALL (identità del tracker vs ID di traccia GT)")
         print(f"  MOTA          : {tm['mota']:.4f}")
         print(f"  IDF1          : {tm['idf1']:.4f}")
+        print(f"  IDP / IDR     : {tm['idp']:.4f} / {tm['idr']:.4f}")
         print(f"  ID switches   : {tm['id_switches']}")
         print(f"  MOTP (IoU)    : {tm['motp_iou']:.4f}")
         print(f"  TP/FP/FN      : {tm['track_tp']} / {tm['track_fp']} / {tm['track_fn']}  (GT: {tm['gt_total']})")
         print(f"  Prec / Rec    : {tm['track_precision']:.4f} / {tm['track_recall']:.4f}")
+        print(f"  MT / PT / ML  : {tm['mostly_tracked']} / {tm['partially_tracked']} / {tm['mostly_lost']}"
+              f"  (su {tm['num_unique_objects']} ID GT)  |  Frag: {tm['num_fragmentations']}")
         print(f"  sequenze      : {tm['num_sequences']}  |  IoU thr: {iou_thr_eval}")
         print("-" * 50)
         if not oracle:
@@ -1448,7 +1290,13 @@ class PastConditionedEvaluator(BaseEvaluator):
                   f"mean<{mean_conf_thr}: {100*diag['fail_conf']/tot_fail:.1f}%  |  "
                   f"coerenza IoU<{coher_thr}: {100*diag['fail_coher']/tot_fail:.1f}%")
             print("-" * 50)
-        print(f"  track creati (ID totali)   : {Track._next_id}")
+        if use_tt:
+            print(f"  tracker                    : TrackTrack-AR (TPA + TAI, CVPR 2025)  {tt_cfg}")
+            print(f"  track creati (ID totali)   : {tt.next_id}")
+            print(f"  TrackTrack-AR              : {tt.summary()}")
+        else:
+            print(f"  track creati (ID totali)   : {Track._next_id}")
+            print(f"  NMS: standard scartate     : {diag['std_nms']}  |  track doppioni eliminati: {diag['dup_tracks']}")
         print("=" * 50)
 
         # ── Scrittura dei file MOTChallenge (uno per sequenza) per eval_tracker.py ──
@@ -1459,36 +1307,20 @@ class PastConditionedEvaluator(BaseEvaluator):
             for seq_name, lines in mot_gt.items():
                 with open(os.path.join(mot_gt_dir, seq_name + '.txt'), 'w') as f:
                     f.write('\n'.join(lines) + ('\n' if lines else ''))
-            print(f"\n[MOT] {len(mot_pred)} sequenze esportate")
+            print(f"\n[MOT] {len(mot_pred)} sequenze esportate (eval_tracker.py su questi file dà gli stessi numeri)")
             print(f"[MOT]   pred → {mot_pred_dir}")
             print(f"[MOT]   gt   → {mot_gt_dir}")
 
-            # ── motmetrics (impl. di riferimento) INLINE, se disponibile ──
-            # Import robusto: eval_tracker è standalone. L'import fallisce se manca eval_tracker
-            # O motmetrics/pandas (eval_tracker li importa al top). In ogni caso la run NON
-            # crasha: si stampa come lanciarlo a mano.
-            _cm = None
-            try:
-                from evaluation.eval_tracker import compute_tracking_metrics as _cm
-            except Exception:
-                try:
-                    from eval_tracker import compute_tracking_metrics as _cm
-                except Exception:
-                    _cm = None
-            if _cm is not None:
-                try:
-                    csv_path = os.path.join(
-                        self.output_dir,
-                        'tracking_motmetrics_oracle.csv' if oracle else 'tracking_motmetrics.csv')
-                    print("\n[MOT] === metriche motmetrics (riferimento — riga OVERALL) ===")
-                    _cm(mot_gt_dir, mot_pred_dir, csv_path)   # (gt_dir, tracks_dir, output_file)
-                    print(f"[MOT] CSV: {csv_path}")
-                except Exception as e:
-                    print(f"[MOT] motmetrics fallito ({type(e).__name__}: {e}) — file MOT comunque salvati.")
-            else:
-                print("[MOT] eval_tracker/motmetrics non importabili (pip install motmetrics?). Calcolo a mano:")
-                print(f"[MOT]   cd src/evaluation && python -c \"from eval_tracker import "
-                      f"compute_tracking_metrics as f; f('{mot_gt_dir}','{mot_pred_dir}','out.csv')\"")
+        # ── motmetrics per sequenza + OVERALL (la riga OVERALL sono i numeri TRACKING sopra) ──
+        if track_metrics.summary is not None:
+            csv_path = os.path.join(
+                self.output_dir,
+                'tracking_motmetrics_oracle.csv' if oracle else
+                'tracking_motmetrics_tracktrack.csv' if use_tt else 'tracking_motmetrics.csv')
+            print("\n[MOT] === metriche motmetrics per sequenza (riga OVERALL = TRACKING sopra) ===")
+            print(track_metrics.render())
+            track_metrics.summary.to_csv(csv_path)
+            print(f"[MOT] CSV: {csv_path}")
 
         import pprint
         pprint.pprint(final_results)
@@ -1500,6 +1332,8 @@ class PastConditionedEvaluator(BaseEvaluator):
         final_results['recall'] = recall
         final_results['f1'] = f1
         final_results.update(tm)   # mota, idf1, id_switches, motp_iou, track_*, ...
+        final_results['ar_std_nms'] = diag['std_nms']        # standard scartate dalla NMS del tracker
+        final_results['ar_dup_tracks'] = diag['dup_tracks']  # track doppioni eliminati
 
         # wandb (se una run è attiva: l'eval può girare dentro uno script di training)
         try:

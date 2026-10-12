@@ -17,7 +17,7 @@ DURATION=${DURATION:-33,165,330}
 LEARNING_RATE=1e-4
 WEIGHT_DECAY=1e-5
 OPTIMIZER="adamw"
-TRAIN_SUBSAMPLE=10            # 10% = test di DIREZIONE. Per il numero del paper: 1
+TRAIN_SUBSAMPLE=${TRAIN_SUBSAMPLE:-10}             # 10% = test di DIREZIONE. Per il numero del paper: 1
 USE_WANDB=1
 USE_NMS=0
 USE_ANNOTATED=0
@@ -41,6 +41,19 @@ RENDER_MODE=${REPR:-metavision}      # rappresentazione input: metavision (defau
 SELECT_NO_CLS=${NOCLS:-0}             # env: NOCLS=1 → best/early-stop su val_loc (val_loss SENZA cls); la cls resta nel training
 USE_PAST_AUG=${PASTAUG:-0}           # env: PASTAUG=1 → augmentation past-oracle (random walk sulle past-box reali) anti exposure-bias AR. Solo-training
 PAST_AUG_STD=${PASTAUGSTD:-0.05}     # std del passo del random walk (frazione); CALIBRARE sull'errore AR misurato (AR oracle vs self)
+USE_PAST_NOISE=${PASTNOISE:-0}       # env: PASTNOISE=1 → rumore REALISTICO sul passato (AR(1) stazionario calibrato sull'errore AR misurato). Solo-training
+USE_VANISH_PAST=${VANISH:-0}         # env: VANISH=1 → finestre di droni che SPARISCONO come negativi + frame vuoti in training. Solo-training
+USE_SELF_PAST=${SELFPAST:-0}         # env: SELFPAST=1 → training curriculum: passato closed-loop del modello (rollout col tracker dell'eval). Solo-training
+# Costo del rollout ≈ un forward per OGNI frame delle sequenze scelte (frame consecutivi, non sottocampionati).
+# Con TRAIN_SUBSAMPLE=10 un'epoca allena solo il 10% dei frame → sottoinsiemi piccoli (≈ +45%/epoca con 0.1/0.2);
+# con TRAIN_SUBSAMPLE=1 si può salire (0.3/0.5 ≈ +15%). SELFPAST_QMIN: guardare q_val/q_train nel log del 1° rollout.
+SELF_PAST_SUBSET=${SELFPAST_SUBSET:-0.1}         # frazione delle sequenze di training per rollout
+SELF_PAST_VAL_SUBSET=${SELFPAST_VAL_SUBSET:-0.2} # frazione delle sequenze di val per misurare q
+SELF_PAST_REFRESH=${SELFPAST_REFRESH:-1}         # rollout ogni N epoche
+SELF_PAST_WARMUP=${SELFPAST_WARMUP:-4}           # epoche di solo passato GT
+SELF_PAST_QMIN=${SELFPAST_QMIN:-0.6}             # ramp: soglia di qualità del passato per far salire p
+SELF_PAST_SCHEDULE=${SELFPAST_SCHEDULE:-ramp}    # ramp | product_iou (q·epoca/epoche) | product_map (mAP50·epoca/epoche)
+SELF_PAST_FLOOR=${SELFPAST_FLOOR:-0.0}           # product_*: minimo del fattore di qualità (0.5 = formula di Gabriele)
 
 # ── FORECASTING (task ausiliario) ──
 NUM_FUTURE_ANNOTATIONS=24
@@ -80,6 +93,10 @@ _VARTAG=""
 [ "${RENDER_MODE}" != "metavision" ] && _VARTAG="${_VARTAG}_${RENDER_MODE}"
 [ "${SELECT_NO_CLS}" = "1" ] && _VARTAG="${_VARTAG}_nocls"
 [ "${USE_PAST_AUG}" = "1" ] && _VARTAG="${_VARTAG}_pastaug"
+[ "${USE_PAST_NOISE}" = "1" ] && _VARTAG="${_VARTAG}_pastnoise"
+[ "${USE_VANISH_PAST}" = "1" ] && _VARTAG="${_VARTAG}_vanish"
+[ "${USE_SELF_PAST}" = "1" ] && _VARTAG="${_VARTAG}_selfpast"
+[ "${USE_SELF_PAST}" = "1" ] && [ "${SELF_PAST_SCHEDULE}" != "ramp" ] && _VARTAG="${_VARTAG}_${SELF_PAST_SCHEDULE}"
 [ -n "${SPLIT_TAG:-}" ] && _VARTAG="${_VARTAG}_${SPLIT_TAG}"   # es. SPLIT_TAG=challenging → run separata dal canonical
 RUN_NAME="joint_scratch_p12_pastdrop_fakepast${_VARTAG}"
 VIS_FREQ=1000
@@ -103,6 +120,7 @@ EVAL_USE_NMS=1
 EVAL_USE_ANNOTATED=0
 EVAL_PROCESSOR_TH=0.3
 AR_STD_BOX_PRIORITY=${STDBOX:-0}   # env: STDBOX=1 → merge-fix (box standard vince, il passato riempie i buchi + dà identità → AR ≥ standard). 0 = M4 (passato prioritario)
+AR_TRACKER=${AR_TRACKER:-legacy}   # env: AR_TRACKER=tracktrack → TrackTrack-AR (TPA + TAI, CVPR 2025) invece del tracker storico
 AR_CONF_THR=${AR_CONF:-0.65}       # soglia score detection CORRENTE del tracker AR (default config 0.35; qui tarato 0.65). env: AR_CONF=0.5 ./run_...
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"   # FRESH: nuova RUN_DIR ogni lancio
@@ -171,6 +189,12 @@ ARCH_ARGS=(
         --std_loss_weight "${STD_LOSS_WEIGHT}" \
         --select_exclude_cls "${SELECT_NO_CLS}" \
         --use_past_aug "${USE_PAST_AUG}" --past_aug_std "${PAST_AUG_STD}" \
+        --use_past_noise "${USE_PAST_NOISE}" --use_vanish_past "${USE_VANISH_PAST}" \
+        --use_self_past "${USE_SELF_PAST}" --self_past_subset "${SELF_PAST_SUBSET}" \
+        --self_past_val_subset "${SELF_PAST_VAL_SUBSET}" --self_past_refresh "${SELF_PAST_REFRESH}" \
+        --self_past_warmup "${SELF_PAST_WARMUP}" --self_past_q_min "${SELF_PAST_QMIN}" --self_past_workers "${NUM_WORKERS}" \
+        --self_past_schedule "${SELF_PAST_SCHEDULE}" --self_past_floor "${SELF_PAST_FLOOR}" \
+        --ar_conf_thr "${AR_CONF_THR}" --ar_std_box_priority "${AR_STD_BOX_PRIORITY}" --ar_tracker "${AR_TRACKER}" \
         "${ARCH_ARGS[@]}" \
         "${RESUME_ARGS[@]}" \
         --trainable_when_frozen "${TRAINABLE_WHEN_FROZEN}" \
@@ -232,7 +256,7 @@ ARCH_ARGS=(
         --use_custom_normalization "${USE_CUSTOM_NORMALIZATION}" --use_nms "${EVAL_USE_NMS}" \
         --vis_every_n_batches "${VIS_EVERY_N_BATCHES}" --eval_forecasting 0 --autoregressive 1 \
         --ar_oracle_past 0 --ar_export_mot 1 --ar_std_box_priority "${AR_STD_BOX_PRIORITY}" \
-        --ar_conf_thr "${AR_CONF_THR}"
+        --ar_conf_thr "${AR_CONF_THR}" --ar_tracker "${AR_TRACKER}"
 
     set -e
     echo "  Evaluation finished"

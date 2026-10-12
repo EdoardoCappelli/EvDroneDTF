@@ -211,6 +211,12 @@ def parse_annotations_coco(annotations, width, height):
     return coco_annotations
 
 
+def frame_key(window):
+    """Chiave stabile di un frame (sequenza, fine finestra in µs), indipendente da subsample e split:
+    collega i sample del training alla cache del passato closed-loop (train/closed_loop_cache.py)."""
+    return (window['hdf5_path'], int(window['window_end_time']))
+
+
 def parse_annotations_normalized(annotations, width, height):
     """
     Convert raw annotations to normalized [cx, cy, w, h] format.
@@ -875,6 +881,7 @@ class FREDMultiDurationTensorDatasetTracking(Dataset):
             'boxes': torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32),
             'labels': torch.tensor(labels, dtype=torch.int64) if labels else torch.zeros((0,), dtype=torch.int64),
             'ids': torch.tensor(ids, dtype=torch.int64) if ids else torch.zeros((0,), dtype=torch.int64),
+            'frame_key': frame_key(window),   # per il passato closed-loop del training curriculum (use_self_past)
         }
 
         # Add past annotations

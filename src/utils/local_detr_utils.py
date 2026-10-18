@@ -316,13 +316,10 @@ def generalized_box_iou(boxes1, boxes2):
 
 def paired_generalized_box_iou(boxes1, boxes2):
     """
-    GIoU ELEMENTWISE tra coppie ALLINEATE: ritorna un vettore (N,) con GIoU(boxes1[i], boxes2[i]).
-
-    Equivalente a `generalized_box_iou(boxes1, boxes2).diag()` ma senza costruire la
-    matrice N×M piena (O(N) invece di O(N²) in tempo e memoria). Box in formato corner
-    [x0, y0, x1, y1]. Usato nelle loss diagonali (pred_flat[i] già appaiato a gt_flat[i]).
+    GIoU(boxes1[i], boxes2[i]) per coppie allineate, box [x0, y0, x1, y1]. Ritorna (N,),
+    come generalized_box_iou(boxes1, boxes2).diag() senza la matrice N x M.
     """
-    # box degeneri → inf/nan: stesso early-check di generalized_box_iou
+    # degenerate boxes gives inf / nan results
     assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
     assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
 

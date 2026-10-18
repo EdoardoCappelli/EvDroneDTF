@@ -5,36 +5,10 @@ import numpy as np
 
 
 class EventBoxPaste:
-    """
-    Trajectory-aware copy-paste augmentation for event cameras.
-
-    At init, builds a per-track trajectory index from the window list:
-        (hdf5_path, track_id) -> [(t_end, annotation), ...] sorted by time.
-
-    At call time:
-      1. Picks a random source track from a random window.
-      2. Retrieves all trajectory points for that track within the
-         max_duration_us window ending at t_end_B.
-      3. For each 33ms time slice [t_{k-1}, t_k], crops events whose
-         (x, y) fall inside the object's box at t_k.
-      4. Applies a single rigid spatial offset so the object's final
-         position lands at the chosen paste location.
-      5. Remaps all pasted timestamps into sample A's temporal window,
-         preserving relative order.
-
-    Because augmentation happens in the raw event domain, the result is
-    valid for any downstream representation (frames, voxels, time surfaces).
-    """
+    """Copy-paste of a drone's events (with its trajectory over the last max_duration_us) from another window."""
 
     def __init__(self, windows, sensor_size, max_duration_us, p=0.5, min_events=30):
-        """
-        Args:
-            windows: list of window dicts (same list used by the dataset).
-            sensor_size: (W, H) tuple.
-            max_duration_us: longest accumulation window in microseconds.
-            p: probability of applying the augmentation per sample.
-            min_events: minimum total pasted events required to proceed.
-        """
+        """sensor_size = (W, H); max_duration_us = longest accumulation window."""
         self.windows = windows
         self.W, self.H = sensor_size
         self.max_duration_us = max_duration_us
@@ -45,10 +19,6 @@ class EventBoxPaste:
         self._traj_index = self._build_trajectory_index(windows)
         n_tracks = len(self._traj_index)
         print(f"EventBoxPaste: trajectory index built — {n_tracks} tracks, {len(self._annotated_windows)} annotated source windows")
-
-    # ------------------------------------------------------------------
-    # Init helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_trajectory_index(windows):
@@ -67,28 +37,14 @@ class EventBoxPaste:
             index[key].sort(key=lambda x: x[0])
         return dict(index)
 
-    # ------------------------------------------------------------------
-    # Augmentation
-    # ------------------------------------------------------------------
-
     def __call__(self, events_A, annotations_A, t_end_A, file_pool):
-        """
-        Args:
-            events_A: structured numpy array with fields x, y, t, p.
-            annotations_A: list of [x1, y1, x2, y2, ...] pixel-coord annotations.
-            t_end_A: end timestamp of sample A (microseconds).
-            file_pool: HDF5FilePool from the calling dataset.
-
-        Returns:
-            (events_aug, annotations_aug) — same types as inputs.
-        """
+        """events_A: structured array (x, y, t, p); annotations_A: pixel boxes. Returns (events, annotations)."""
         if random.random() > self.p:
             return events_A, annotations_A
 
         if events_A is None or len(events_A) == 0:
             return events_A, annotations_A
 
-        # --- pick source window and track --------------------------------
         window_B = random.choice(self._annotated_windows)
         ann_B = random.choice(window_B["annotations"])
         if len(ann_B) < 6:
@@ -102,7 +58,6 @@ class EventBoxPaste:
         if traj_key not in self._traj_index:
             return events_A, annotations_A
 
-        # --- collect trajectory within max_duration_us window ----------
         t_window_start = t_end_B - self.max_duration_us
         traj = [
             (t, ann)
@@ -112,7 +67,7 @@ class EventBoxPaste:
         if not traj:
             return events_A, annotations_A
 
-        # --- final box defines paste size and rigid offset --------------
+        # final box sets paste size and offset
         _, ann_final = traj[-1]
         x1_f = float(ann_final[0])
         y1_f = float(ann_final[1])
@@ -132,7 +87,6 @@ class EventBoxPaste:
         dx = float(new_x1) - x1_f
         dy = float(new_y1) - y1_f
 
-        # --- load full event stream for B once --------------------------
         events_B = file_pool.load_events(hdf5_B, t_window_start, t_end_B)
         if events_B is None or len(events_B) == 0:
             return events_A, annotations_A
@@ -142,8 +96,7 @@ class EventBoxPaste:
         tB = events_B["t"].astype(np.int64)
         obj_dtype = events_A.dtype
 
-        # --- crop per time slice using the box at the slice's end -------
-        # slice k: [t_boundaries[k], t_boundaries[k+1]] using ann at traj[k]
+        # slice k is cropped with the box of traj[k]
         t_boundaries = [t_window_start] + [t for t, _ in traj]
 
         chunks = []
@@ -186,21 +139,16 @@ class EventBoxPaste:
         if len(obj_events) < self.min_events:
             return events_A, annotations_A
 
-        # --- shift timestamps into A's temporal window ------------------
-        # Use a constant offset (t_end_A - t_end_B) so the pasted object's
-        # temporal density and trajectory speed are preserved exactly.
-        # A 66ms trail in B occupies the last 66ms of A's window — not
-        # stretched to fill the full 330ms.
+        # constant offset keeps the trail's duration and speed
         t_offset = np.int64(t_end_A) - np.int64(t_end_B)
         obj_events["t"] = (
             obj_events["t"].astype(np.int64) + t_offset
         ).astype(obj_dtype["t"].type)
 
-        # --- merge and sort by timestamp --------------------------------
         events_aug = np.concatenate([events_A, obj_events])
         events_aug = events_aug[np.argsort(events_aug["t"])]
 
-        # label: translated final box, preserving any extra fields (class, track)
+        # label: translated final box
         new_ann = list(ann_final)
         new_ann[0] = float(new_x1)
         new_ann[1] = float(new_y1)

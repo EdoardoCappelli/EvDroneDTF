@@ -6,10 +6,10 @@ import re
 import json
 from pathlib import Path
 
-# valori numerici robusti: notazione scientifica (1.97e-05) e segno negativo (MOTA)
+# numeri anche negativi o in notazione scientifica
 _NUM = r"(-?[\d.]+(?:[eE][+-]?\d+)?)"
 
-# ── Detection (dal pprint dict + dal riepilogo di evaluate()) ──
+# detection
 DET_PATTERNS = {
     "map":       rf"(?m)^\s*\{{?\s*'?map'?\s*[:=]\s*(?:tensor\()?\s*{_NUM}",
     "map_50":    rf"(?m)^\s*\{{?\s*'?map_50'?\s*[:=]\s*(?:tensor\()?\s*{_NUM}",
@@ -19,7 +19,7 @@ DET_PATTERNS = {
     "recall":    rf"(?m)^\s*Recall\s*:\s*{_NUM}",
     "f1":        rf"(?m)^\s*F1\s*:\s*{_NUM}",
 }
-# ── Forecasting (formato reale: "ADE full      (px)  :"; orizzonti short_0_4s / mid_0_8s) ──
+# forecasting
 FORECAST_PATTERNS = {
     "ADE_full": rf"ADE full\s*\(px\)\s*:\s*{_NUM}",
     "FDE_full": rf"FDE full\s*\(px\)\s*:\s*{_NUM}",
@@ -29,16 +29,23 @@ FORECAST_PATTERNS = {
     "FDE_0.8s": rf"FDE mid_0_8s\s*\(px\)\s*:\s*{_NUM}",
     "mean_iou": rf"mean future IoU\s*:\s*{_NUM}",
 }
-# ── Tracking (dal blocco AUTOREGRESSIVE) ──
+# tracking (sezione autoregressiva)
 TRACK_PATTERNS = {
     "MOTA":        rf"MOTA\s*:\s*{_NUM}",
     "IDF1":        rf"IDF1\s*:\s*{_NUM}",
     "ID_switches": r"ID switches\s*:\s*(\d+)",
     "MOTP":        rf"MOTP \(IoU\)\s*:\s*{_NUM}",
 }
+# AR: mAP full-PR (tutti gli output), confrontabile con Both/Standard
+FULLPR_PATTERNS = {
+    "map_fullpr":   rf"'map_fullpr'\s*:\s*{_NUM}",
+    "map50_fullpr": rf"'map50_fullpr'\s*:\s*{_NUM}",
+    "map75_fullpr": rf"'map75_fullpr'\s*:\s*{_NUM}",
+}
+# intestazione del full-PR: dice se è calcolata con NMS
+FULLPR_HEADER_PAT = r"mAP AR FULL-PR([^\n]*)"
 
-# ── Epoca del checkpoint testato: riga "Checkpoint from epoch: N" (o "Checkpoints ...")
-#    stampata dall'evaluator al load. Robusta a singolare/plurale e maiuscole. ──
+# epoca del checkpoint testato
 CKPT_EPOCH_PAT = r"(?i)Checkpoints?\s+from\s+epoch\s*:\s*(\d+)"
 
 
@@ -60,27 +67,33 @@ def extract_per_step_ade(text):
     return out
 
 
+def extract_fullpr(text, before):
+    """mAP full-PR di una sezione AR e fullpr_nms ('1' con NMS, '0' senza, 'N/A' se manca)."""
+    out = {k: v if v == "N/A" else f"{float(v):.4f}" for k, v in extract(text, FULLPR_PATTERNS).items()}
+    heads = re.findall(FULLPR_HEADER_PAT, before)
+    out["fullpr_nms"] = ("1" if "NMS" in heads[-1] else "0") if heads else "N/A"
+    return out
+
+
 def split_sections(content):
-    """Un solo test.log contiene più pass concatenati → li separo in sezioni,
-    ancorando ai marker STAMPATI DALL'EVALUATOR (non ai nomi file)."""
+    """Divide un test log nei suoi pass: [(label, testo, inizio)]."""
     anchors = []
-    # detection: riepilogo di evaluate()  →  "  Query mode                 : both"
+    # detection: riga "Query mode : ..."
     for m in re.finditer(r"Query mode\s*:\s*(both|standard_only|past_only)", content):
         anchors.append((m.start(), f"detection_{m.group(1)}"))
     # forecasting: header  "  FORECASTING"
     for m in re.finditer(r"(?m)^\s*FORECASTING\s*$", content):
         anchors.append((m.start(), "forecasting"))
-    # autoregressive: "MODE : AUTOREGRESSIVE (closed-loop)" oppure "(oracle-past)". La variante
-    # fra parentesi separa AR (passato predetto) da oracle (passato GT). Retro-compat: senza
-    # parentesi (log vecchi) → 'autoregressive'.
+    # autoregressive: "MODE : AUTOREGRESSIVE (...)", la variante distingue AR, oracle e tracktrack
     for m in re.finditer(r"MODE\s*:\s*AUTOREGRESSIVE(?:\s*\(([^)]*)\))?", content):
         variant = (m.group(1) or "").lower()
-        anchors.append((m.start(), "autoregressive_oracle" if "oracle" in variant else "autoregressive"))
+        anchors.append((m.start(), "autoregressive_oracle" if "oracle" in variant else
+                        "autoregressive_tracktrack" if "tracktrack" in variant else "autoregressive"))
     anchors.sort(key=lambda a: a[0])
     sections = []
     for i, (pos, label) in enumerate(anchors):
         end = anchors[i + 1][0] if i + 1 < len(anchors) else len(content)
-        sections.append((label, content[pos:end]))
+        sections.append((label, content[pos:end], pos))
     return sections
 
 
@@ -88,35 +101,34 @@ def parse_test_log(path):
     """Ritorna {label -> metriche} per un test.log (che può contenere tutti i pass)."""
     evals = {}
     content = path.read_text(errors="ignore")
-    for label, text in split_sections(content):
+    prev = 0
+    for label, text, start in split_sections(content):
+        before, prev = content[prev:start], start
         if label.startswith("detection"):
             metrics = extract(text, DET_PATTERNS)
         elif label == "forecasting":
             metrics = extract(text, FORECAST_PATTERNS)
             metrics.update(extract_per_step_ade(text))
         elif label.startswith("autoregressive"):
-            # AR / oracle: mAP + prec/rec/f1 closed-loop  +  tracking (MOTA/IDF1/ID-sw/MOTP)
             metrics = extract(text, DET_PATTERNS)
+            metrics.update(extract_fullpr(text, before))
             metrics.update(extract(text, TRACK_PATTERNS))
         else:
             continue
-        if label in evals:                      # stessa label due volte → disambigua
+        if label in evals:                      # stessa label due volte
             label = f"{label}__{path.stem}"
         evals[label] = metrics
     return evals
 
 
 def run_after(run_name, since):
-    """True se il timestamp nel nome run (..._YYYYMMDD_HHMMSS) è >= since (inclusivo).
-    Il timestamp è SEMPRE in coda (RUN_DIR = <run_name>_YYYYMMDD_HHMMSS): gli ultimi due
-    campi separati da '_' → [-2] = YYYYMMDD (data), [-1] = HHMMSS (ora).
-    Confronto su cifre: YYYYMMDD[HHMMSS] ordina lessicograficamente = cronologicamente."""
+    """True se il timestamp in coda al nome della run (YYYYMMDD_HHMMSS) è >= since."""
     if not since:
         return True
     parts = run_name.split('_')
     d, t = (parts[-2], parts[-1]) if len(parts) >= 2 else ('', '')
     if not (len(d) == 8 and d.isdigit() and len(t) == 6 and t.isdigit()):
-        return False                              # SINCE attivo ma niente timestamp valido → escludo
+        return False                              # nessun timestamp valido
     since_digits = re.sub(r"\D", "", since)        # tengo solo le cifre di SINCE
     return (d + t)[:len(since_digits)] >= since_digits
 
@@ -130,8 +142,7 @@ def parse_durations(train_log):
 
 
 def parse_checkpoint_epoch(test_logs):
-    """Epoca del checkpoint usato in test — riga 'Checkpoint from epoch: N' stampata
-    dall'evaluator al load. Tutti i pass usano lo STESSO best_model.pt → prima occorrenza."""
+    """Epoca del checkpoint testato (prima riga 'Checkpoint from epoch')."""
     for tlog in test_logs:
         m = re.search(CKPT_EPOCH_PAT, tlog.read_text(errors="ignore"))
         if m:
@@ -139,11 +150,7 @@ def parse_checkpoint_epoch(test_logs):
     return "N/A"
 
 
-# ── query_mixed / shared: dal config.json della run ──────────────────────────
-#    Fonte autorevole = config.json scritto dal trainer (self.config.to_json()).
-#    PREFERISCO quello in checkpoints/ (config di TRAINING): l'evaluator ne scrive
-#    un altro a livello-run che può avere use_mixed_query_mode al default (0),
-#    perché in eval quel flag non si passa → sarebbe fuorviante.
+# flag della run dal config.json (prima quello di training, in checkpoints/)
 def find_config_json(run_path):
     """config.json della run, dando priorità a quello di training (checkpoints/)."""
     prefer = run_path / "checkpoints" / "config.json"
@@ -170,15 +177,31 @@ def _find_in_config(obj, key):
     return None
 
 
+# flag stampato -> chiave del config.json
+CONFIG_FLAGS = {
+    "query_mixed": "use_mixed_query_mode",
+    "shared":      "use_shared_weights",
+    "cv_anchor":   "use_cv_anchor",
+    "fakepast":    "use_fake_past",
+    "pastdrop":    "use_past_dropout",
+    "pastnoise":   "use_past_noise",
+    "vanish":      "use_vanish_past",
+    "selfpast":    "use_self_past",
+}
+# schedule del curriculum closed-loop, conta solo con selfpast=1
+SCHEDULE_KEY = "self_past_schedule"
+
+
 def parse_config_flags(run_path):
-    """{query_mixed, shared} dal config.json della run — '1' / '0' / 'N/A'."""
+    """Flag di CONFIG_FLAGS ('1' / '0' / 'N/A') e schedule ('-' se selfpast non è attivo)."""
+    na = {k: "N/A" for k in (*CONFIG_FLAGS, "schedule")}   # run senza config.json leggibile
     cfg_path = find_config_json(run_path)
     if cfg_path is None:
-        return {"query_mixed": "N/A", "shared": "N/A"}
+        return na
     try:
         cfg = json.loads(cfg_path.read_text(errors="ignore"))
     except Exception:
-        return {"query_mixed": "N/A", "shared": "N/A"}
+        return na
 
     def _fmt(key):
         v = _find_in_config(cfg, key)
@@ -188,9 +211,11 @@ def parse_config_flags(run_path):
                  or str(v).strip().lower() in ('1', 'true', 'yes', 'on')
         return "1" if truthy else "0"
 
-    return {"query_mixed": _fmt("use_mixed_query_mode"),
-            "shared":      _fmt("use_shared_weights"),
-            "cv_anchor":   _fmt("use_cv_anchor")}
+    out = {k: _fmt(key) for k, key in CONFIG_FLAGS.items()}
+    sched = _find_in_config(cfg, SCHEDULE_KEY)
+    out["schedule"] = ("-" if out["selfpast"] != "1" else
+                       str(sched).strip().lower() if sched is not None else "N/A")
+    return out
 
 
 def main():
@@ -208,7 +233,7 @@ def main():
     base_dir   = Path(args.runs_dir)
     since      = args.since.strip()
     run_filter = args.run_filter.strip()
-    # Config attiva SEMPRE stampata → si vede subito se il filtro è impostato o no.
+    # config attiva
     print(f"[config] runs_dir={base_dir} | since={since or '(nessuno)'} | "
           f"run_filter={run_filter or '(nessuno)'}\n")
 
@@ -241,17 +266,17 @@ def main():
             "nome_run":    run_path.name,
             "durations":   parse_durations(next(run_path.glob("train_*.log"), None)),
             "checkpoint_epoch": parse_checkpoint_epoch(test_logs),
-            "query_mixed": cfg_flags["query_mixed"],
-            "shared":      cfg_flags["shared"],
-            "cv_anchor":   cfg_flags["cv_anchor"],
+            **cfg_flags,
             "evaluations": evaluations,
         })
 
-    # ── Stampa leggibile ──
+    # stampa
     for run in all_runs:
         print("=" * 72)
         print(f"RUN: {run['nome_run']}   (durations: {run['durations']}  |  ckpt epoch: {run['checkpoint_epoch']}"
-              f"  |  query_mixed: {run['query_mixed']}  |  shared: {run['shared']}  |  cv_anchor: {run['cv_anchor']})")
+              f"  |  query_mixed: {run['query_mixed']}  |  shared: {run['shared']}  |  cv_anchor: {run['cv_anchor']}) | "
+              f"fakepast: {run['fakepast']}  |  pastdrop: {run['pastdrop']}  |  pastnoise: {run['pastnoise']}"
+              f"  |  vanish: {run['vanish']}  |  selfpast: {run['selfpast']}  |  schedule: {run['schedule']}")
         for label in sorted(run["evaluations"]):
             ev = run["evaluations"][label]
             base = {k: v for k, v in ev.items() if not k.startswith("ADE_t")}

@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
 """
-Ri-affetta il preprocessed FRED su uno split diverso (es. challenging) SENZA ri-preprocessare
-gli HDF5.
+Ripartisce le finestre del preprocessed FRED (train + test) secondo i .txt di un altro split
+(es. challenging), senza ri-preprocessare gli HDF5. Scrive train_/test_windows_<acc>ms.json in --out.
 
-Il preprocessed canonical (`train_windows_33ms.json` + `test_windows_33ms.json`) copre TUTTE le
-sequenze del dataset. Uno "split" (canonical / challenging) è solo una diversa PARTIZIONE delle
-stesse sequenze in train/test, definita da due file `.txt` che elencano le cartelle-sequenza
-(es. `9/`, `8/`, `230/`). Qui si ri-partizionano le stesse finestre secondo quei `.txt`.
-
-La cartella-sequenza di ogni finestra si ricava dal suo path:
-    hdf5_path = .../{folder}/Event/events.hdf5   →   folder = basename(dirname(dirname(hdf5_path)))
-Il path resta ASSOLUTO e invariato (il file HDF5 sta dov'è fisicamente, a prescindere dallo split
-label): cambia solo in quale JSON finisce la finestra.
-
-Output: `train_windows_<acc>ms.json` e `test_windows_<acc>ms.json` con i NOMI CANONICI dentro
-`--out`, così si usa direttamente con `INDEX_PATH=--out` (i prefissi `train_`/`test_` che il
-dataset_factory si aspetta combaciano).
-
-Uso (sul cluster, dopo aver copiato i due .txt del challenging):
-  python make_split_index.py \
-      --preprocessed /seidenas/datasets/FRED/preprocessed \
-      --train_split  challenging_train_split.txt \
-      --test_split   challenging_test_split.txt \
+  python make_split_index.py --preprocessed /seidenas/datasets/FRED/preprocessed \
+      --train_split challenging_train_split.txt --test_split challenging_test_split.txt \
       --out /seidenas/datasets/FRED/preprocessed_challenging
 """
 import argparse
@@ -31,7 +14,7 @@ import os
 
 
 def load_folders(txt_path):
-    """Insieme delle cartelle-sequenza da un .txt (una per riga, es. '9/' → '9')."""
+    """Cartelle-sequenza di un .txt ('9/' -> '9')."""
     folders = set()
     with open(txt_path) as f:
         for line in f:
@@ -42,7 +25,7 @@ def load_folders(txt_path):
 
 
 def folder_of(window):
-    """Cartella-sequenza di una finestra: .../{folder}/Event/events.hdf5 → {folder}."""
+    """.../{folder}/Event/events.hdf5 -> {folder}"""
     return os.path.basename(os.path.dirname(os.path.dirname(window['hdf5_path'])))
 
 
@@ -56,7 +39,7 @@ def main():
     ap.add_argument('--acc_ms', type=int, default=33, help="accumulazione (default 33)")
     a = ap.parse_args()
 
-    # 1) Unione di TUTTE le finestre (train + test canonical = tutte le sequenze) ──────────
+    # 1) unione di tutte le finestre (train + test)
     pool, template = [], None
     for name in ('train', 'test'):
         p = os.path.join(a.preprocessed, f'{name}_windows_{a.acc_ms}ms.json')
@@ -73,7 +56,7 @@ def main():
     _sample = pool[0]['hdf5_path'] if pool else '(vuoto)'
     print(f"[check] esempio hdf5_path: {_sample}  ->  folder={folder_of(pool[0]) if pool else '?'}")
 
-    # 2) Ri-partiziona secondo i .txt e scrivi coi NOMI CANONICI ──────────────────────────
+    # 2) ripartizione secondo i .txt
     os.makedirs(a.out, exist_ok=True)
     for split_name, txt in (('train', a.train_split), ('test', a.test_split)):
         want = load_folders(txt)

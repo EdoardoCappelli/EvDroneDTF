@@ -13,13 +13,14 @@ class RTDetrMultiScaleOutput:
     logits: Optional[torch.Tensor] = None
     pred_boxes: Optional[torch.Tensor] = None
     encoder_last_hidden_state: Optional[List[torch.Tensor]] = None
-    future_boxes: Optional[torch.Tensor] = None      # (B, N, T, 4) — forecasting (passo 3)
-    present_refined: Optional[torch.Tensor] = None   # (B, N, 4) — presente raffinato dalla forecasting head (Proposta C)
-    # ── Supervisione RT-DETR del ramo standard (per branch.loss_function) ──
-    enc_topk_logits: Optional[torch.Tensor] = None      # (B, S, num_labels) — proposte encoder ai topk → supervisiona enc_score_head
-    enc_topk_bboxes: Optional[torch.Tensor] = None      # (B, S, 4) — box encoder ai topk (sigmoid)
-    intermediate_logits: Optional[torch.Tensor] = None  # (B, L, Q, num_labels) — deep supervision (ogni layer)
-    intermediate_boxes: Optional[torch.Tensor] = None   # (B, L, Q, 4) — deep supervision (ogni layer)
+    future_boxes: Optional[torch.Tensor] = None      # (B, N, T, 4)
+    present_refined: Optional[torch.Tensor] = None   # (B, N, 4)
+    # supervisione RT-DETR del ramo standard
+    enc_topk_logits: Optional[torch.Tensor] = None      # (B, S, num_labels), proposte encoder ai topk
+    enc_topk_bboxes: Optional[torch.Tensor] = None      # (B, S, 4)
+    intermediate_logits: Optional[torch.Tensor] = None  # (B, L, Q, num_labels), ogni layer
+    intermediate_boxes: Optional[torch.Tensor] = None   # (B, L, Q, 4), ogni layer
+    hidden_states: Optional[torch.Tensor] = None        # (B, Q, D)
 
 class LogFourierScaleEncoding(nn.Module):
     """Log-Fourier temporal encoding for duration information."""
@@ -63,13 +64,7 @@ class PastEncoder(nn.Module):
         return x
 
 def _cv_anchor(present_boxes: torch.Tensor, past_velocity: Optional[torch.Tensor], T: int) -> torch.Tensor:
-    """
-    Ancora la predizione futura alla VELOCITÀ COSTANTE: anchor_t = present + (t+1)·velocity.
-    Se velocity è None → anchor_t = present (fallback residuo dal presente).
-
-    Serve a evitare il COLLASSO sul presente: il delta della testa parte da una
-    traiettoria già in moto (estrapolazione lineare del passato), non da box ferme.
-    """
+    """anchor_t = present + (t+1) * velocity, oppure present se velocity è None."""
     anchor = present_boxes.unsqueeze(2)                       # (B, Q, 1, 4)
     if past_velocity is not None:
         steps = torch.arange(1, T + 1, device=present_boxes.device,
@@ -80,18 +75,8 @@ def _cv_anchor(present_boxes: torch.Tensor, past_velocity: Optional[torch.Tensor
 
 class ForecastingHead(nn.Module):
     """
-    Testa di forecasting a Transformer (ispirata ad AFO_Head, che funzionava).
-
-    Costruisce due tipi di token che attendono, via CROSS-ATTENTION, le feature encoder
-    fuse (accesso all'immagine) e interagiscono via SELF-ATTENTION:
-      - 1 token "presente" per drone tracciato → RAFFINA la box di detection (Proposta C);
-      - 1 token "futuro" per ogni coppia (drone, step) → predice T box future.
-    Le box future sono delta rispetto al PRESENTE RAFFINATO (non a quello grezzo),
-    chiudendo il loop detection↔forecasting.
-
-    Nota: il ramo di encoding temporale (future_time_deltas) è stato RIMOSSO perché mai
-    esercitato in training (il trainer non passa future_time_deltas). Il parametro resta
-    nella firma solo per compatibilità di chiamata, ma è ignorato.
+    Forecasting head a transformer: un token presente per drone (raffina la box) e un token per
+    step futuro, in cross-attention sulle feature encoder. future_time_deltas è ignorato.
     """
     def __init__(
         self,
@@ -109,29 +94,27 @@ class ForecastingHead(nn.Module):
         self.d_model = d_model
         self.pool_size = pool_size
 
-        # embedding appreso per ciascuno step futuro + marcatore del token "presente"
+        # embedding degli step futuri e del token presente
         self.step_embed = nn.Parameter(torch.randn(1, num_future_steps, d_model) * 0.02)
         self.present_embed = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
 
-        # memoria per cross-attention: feature encoder pooled → token
+        # memoria: feature encoder pooled
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
         self.mem_proj = nn.Sequential(nn.Linear(d_model, d_model), nn.LayerNorm(d_model))
 
-        # transformer decoder (i token presente/futuro attendono la memoria immagine)
         layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
             dropout=dropout, activation='relu', batch_first=True,
         )
         self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
 
-        # testa per il delta della box FUTURA (MLP 3-layer)
+        # delta delle box future
         self.bbox = nn.Sequential(
             nn.Linear(d_model, 512), nn.ReLU(),
             nn.Linear(512, 512), nn.ReLU(),
             nn.Linear(512, 4),
         )
-        # testa per il delta del PRESENTE (refinement). Ultimo layer a zero → a init
-        # present_refined == pred_boxes (stabilità: non disturba la detection pretrained).
+        # delta del presente, ultimo layer a zero (a init present_refined == pred_boxes)
         self.present_bbox = nn.Sequential(
             nn.Linear(d_model, 512), nn.ReLU(),
             nn.Linear(512, 512), nn.ReLU(),
@@ -141,7 +124,7 @@ class ForecastingHead(nn.Module):
         nn.init.zeros_(self.present_bbox[-1].bias)
 
     def _memory(self, fused_features: List[torch.Tensor]) -> torch.Tensor:
-        """fused_features: lista di (B, D, H_s, W_s) → (B, S*P*P, D)."""
+        """[(B, D, H_s, W_s)] -> (B, S*P*P, D)"""
         parts = []
         for f in fused_features:
             p = self.pool(f).flatten(2).transpose(1, 2)                 # (B, P*P, D)
@@ -154,9 +137,9 @@ class ForecastingHead(nn.Module):
         hidden_states: torch.Tensor,                 # (B, N, D) embedding per query-passato
         present_boxes: torch.Tensor,                 # (B, N, 4) box detected (grezze)
         fused_features: List[torch.Tensor],          # feature encoder fuse (memoria)
-        future_time_deltas: Optional[torch.Tensor] = None,   # ignorato (ramo temporale rimosso)
+        future_time_deltas: Optional[torch.Tensor] = None,   # ignorato
         past_velocity: Optional[torch.Tensor] = None,        # (B, N, 4) velocità/step (ancora CV)
-        use_present_refine: bool = True,             # False → presente grezzo (Proposta C OFF)
+        use_present_refine: bool = True,             # False = presente grezzo
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Ritorna (present_refined (B,N,4), future_boxes (B,N,T,4))."""
         B, N, D = hidden_states.shape
@@ -168,20 +151,19 @@ class ForecastingHead(nn.Module):
                       + self.step_embed.view(1, 1, T, D)).reshape(B, N * T, D)
 
         if use_present_refine:
-            # Token presente (1 per drone) + token futuri, decodificati insieme
+            # token presente + token futuri
             present_tok = hidden_states + self.present_embed           # (B, N, D)
             tgt = torch.cat([present_tok, future_tok], dim=1)          # (B, N + N*T, D)
             dec = self.decoder(tgt=tgt, memory=memory)
             present_dec = dec[:, :N]                                   # (B, N, D)
             future_dec = dec[:, N:].view(B, N, T, D)                   # (B, N, T, D)
-            # Present refinement: delta dalla box di detection grezza (a init delta=0)
             present_refined = (present_boxes + self.present_bbox(present_dec)).clamp(0.0, 1.0)
         else:
-            # Baseline (Proposta C OFF): solo token futuri, presente NON raffinato
+            # solo token futuri, presente grezzo
             future_dec = self.decoder(tgt=future_tok, memory=memory).view(B, N, T, D)
             present_refined = present_boxes
 
-        # Future: delta dall'ancora CV costruita sul presente (raffinato se attivo)
+        # future = ancora CV + delta
         deltas = self.bbox(future_dec)                                 # (B, N, T, 4)
         anchor = _cv_anchor(present_refined, past_velocity, T)         # (B, N, T, 4)
         future_boxes = (anchor + deltas).clamp(0.0, 1.0)
@@ -189,12 +171,7 @@ class ForecastingHead(nn.Module):
 
 
 class ForecastingHeadMLP(nn.Module):
-    """
-    BASELINE semplice: due MLP dall'embedding di query producono (1) il delta di
-    refinement del presente e (2) le T box future (delta dal presente raffinato).
-    Ignora fused_features e future_time_deltas (firma compatibile con la testa
-    transformer, così il call-site non cambia). Ritorna (present_refined, future_boxes).
-    """
+    """Baseline MLP con la stessa interfaccia di ForecastingHead."""
     def __init__(self, d_model: int, num_future_steps: int, hidden_dim: int = 512):
         super().__init__()
         self.num_future_steps = num_future_steps
@@ -203,7 +180,7 @@ class ForecastingHeadMLP(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, num_future_steps * 4),
         )
-        # refinement del presente; ultimo layer a zero → present_refined == pred_boxes a init
+        # refinement del presente, ultimo layer a zero
         self.present_mlp = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.ReLU(),
@@ -219,7 +196,7 @@ class ForecastingHeadMLP(nn.Module):
         if use_present_refine:
             present_refined = (present_boxes + self.present_mlp(hidden_states)).clamp(0.0, 1.0)
         else:
-            present_refined = present_boxes   # baseline: presente grezzo (Proposta C OFF)
+            present_refined = present_boxes
         deltas = self.mlp(hidden_states).view(B, N, T, 4)
         anchor = _cv_anchor(present_refined, past_velocity, T)   # (B, N, T, 4)
         future_boxes = (anchor + deltas).clamp(0.0, 1.0)
@@ -279,9 +256,7 @@ class MultiScaleAttentionFusion(nn.Module):
         device = multi_scale_features[0][0].device
         fused_scales = []
 
-        # time_embed dipende SOLO dalle durate (K valori): identico per ogni scala e per
-        # ogni posizione spaziale. Calcolato UNA volta e broadcastato (prima: ricalcolato
-        # su B*L righe identiche ad ogni scala — hot-path, spreco O(B*L*K)).
+        # time_embed dipende solo dalle durate: calcolato una volta per tutte le scale
         durations_t = torch.tensor(durations, device=device, dtype=torch.float32)  # (K,)
         time_embed = self.temporal_encoding(durations_t.unsqueeze(0))              # (1, K, D)
 
@@ -324,12 +299,12 @@ class MultiDurationRTDetrAttention(nn.Module):
         phase: int = 1,
         num_standard_queries: int = 5,
         num_future_steps: int = 0,
-        forecast_head_type: str = 'transformer',   # 'transformer' (default) | 'mlp' (baseline)
-        vel_avg_k: int = 3,   # n. step su cui mediare la velocità per l'ancora CV
-        use_cv_anchor: bool = True,   # False → future = present + delta (niente ancora CV: il modello impara il moto)
-        use_present_refine: bool = True,   # False → niente present-refinement (Proposta C OFF): future ancorate al presente grezzo
-        block_diag_decoder_attn: bool = False,   # True → self-attn a BLOCCHI nel decoder (past↔past, std↔std): ramo standard standalone anche in 'both' (ablation)
-        use_past_class_head: bool = False,   # True → testa di classificazione DEDICATA al ramo passato (disaccoppia lo score past dalla VFL standard)
+        forecast_head_type: str = 'transformer',   # 'transformer' | 'mlp'
+        vel_avg_k: int = 3,   # step su cui mediare la velocità per l'ancora CV
+        use_cv_anchor: bool = True,   # False: future = present + delta
+        use_present_refine: bool = True,   # False: presente grezzo
+        block_diag_decoder_attn: bool = False,   # True: niente attenzione past <-> std nel decoder
+        use_past_class_head: bool = False,   # True: class_embed separata per il ramo passato
     ):
         super().__init__()
 
@@ -370,18 +345,13 @@ class MultiDurationRTDetrAttention(nn.Module):
 
         self.num_standard_queries = num_standard_queries
 
-        # Testa di forecasting (passo 3): creata solo se num_future_steps > 0,
-        # così i checkpoint di sola detection restano compatibili.
-        # forecast_head_type: 'transformer' (default) | 'mlp' (baseline semplice)
+        # forecasting head solo se num_future_steps > 0
         self.num_future_steps = num_future_steps
         self.vel_avg_k = vel_avg_k
         self.use_cv_anchor = use_cv_anchor
         self.use_present_refine = use_present_refine
         self.block_diag_decoder_attn = block_diag_decoder_attn
-        # Testa di classificazione DEDICATA al ramo passato (esperimento): disaccoppia lo score
-        # delle past-query dalla VFL del ramo standard, che oggi CONDIVIDE la stessa class_embed.
-        # Init = copia della testa standard → epoca 0 identica al modello attuale, poi diverge.
-        # Disaccoppia SOLO lo score: la box resta a bbox_embed condivisa.
+        # class_embed separata per le past-query, inizializzata da quella standard
         self.use_past_class_head = use_past_class_head
         if use_past_class_head:
             import copy
@@ -406,7 +376,7 @@ class MultiDurationRTDetrAttention(nn.Module):
 
     @property
     def primary_branch(self):
-        """Branch RTDetrV2 primario (espone .loss_function e .config) — per la loss ufficiale del ramo standard."""
+        """Branch che fornisce .loss_function e .config per la loss del ramo standard."""
         return self.shared_branch if self.use_shared_weights else self.branches[f'branch_{self.durations_ms[0]}ms']
 
     def _run_backbone_and_encoder(
@@ -475,7 +445,7 @@ class MultiDurationRTDetrAttention(nn.Module):
         # 4. Encoder proposals → top-k query initialisation
         use_standard = (self.phase == 2 and query_mode in ('both', 'standard_only'))
 
-        # Proposte encoder ai topk: servono a branch.loss_function (loss encoder + selezione query).
+        # proposte encoder ai topk, per branch.loss_function
         enc_topk_logits = None
         enc_topk_bboxes = None
 
@@ -498,8 +468,7 @@ class MultiDurationRTDetrAttention(nn.Module):
                 index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_coord_logits.shape[-1])
             )
 
-            # RT-DETR: score/box delle proposte encoder ai topk (per branch.loss_function).
-            # enc_topk_logits supervisiona enc_score_head → la selezione impara a trovare i droni.
+            # score/box delle proposte ai topk (supervisionano enc_score_head)
             enc_topk_logits = enc_outputs_class.gather(
                 dim=1, index=topk_ind.unsqueeze(-1).repeat(1, 1, enc_outputs_class.shape[-1])
             )
@@ -527,8 +496,7 @@ class MultiDurationRTDetrAttention(nn.Module):
             ref_points = torch.cat([past_ref_points_unact, std_ref], dim=1)
 
 
-        # encoder attention mask: maschero le query passate non informative (padding). Con
-        # block_diag_decoder_attn maschero ANCHE past↔standard (blocco diagonale, per l'ablation).
+        # maschero le query passate di padding (e past <-> std con block_diag_decoder_attn)
         encoder_attention_mask = None
         block_diag = bool(getattr(self, 'block_diag_decoder_attn', False)) and query_mode == 'both' and self.phase == 2
         if (query_mode != 'standard_only' and past_mask is not None) or block_diag:
@@ -549,13 +517,10 @@ class MultiDurationRTDetrAttention(nn.Module):
             encoder_attention_mask = torch.zeros(batch_size, 1, Q, Q, dtype=dtype, device=device)
             encoder_attention_mask = encoder_attention_mask.masked_fill(key_padding[:, None, None, :], neg)
 
-            # ── Maschera a BLOCCHI (flag block_diag_decoder_attn): past↔past e std↔std, niente past↔std ──
-            # In 'both' le query standard non attendono mai il passato → allenate/valutate come standalone
-            # (elimina l'interferenza AR e allena il ramo standard da solo). La dedup passa a M4.
             if block_diag:
                 N = past_boxes.shape[1]                       # slot passato = [0:N]; standard = [N:]
-                encoder_attention_mask[:, :, :N, N:] = neg    # le past NON attendono le standard
-                encoder_attention_mask[:, :, N:, :N] = neg    # le standard NON attendono le past
+                encoder_attention_mask[:, :, :N, N:] = neg    # le past non attendono le standard
+                encoder_attention_mask[:, :, N:, :N] = neg    # le standard non attendono le past
 
         # 7. Transformer decoder
         decoder_outputs = model.decoder(
@@ -578,9 +543,7 @@ class MultiDurationRTDetrAttention(nn.Module):
             num_tracked_drones = past_boxes.shape[1]
             hidden_states = decoder_outputs.last_hidden_state[:, :num_tracked_drones]
         
-        # Applico le teste. Con use_past_class_head, le past-query usano una class_embed DEDICATA
-        # (disaccoppiata dalla VFL standard); le query standard restano sulla testa condivisa.
-        # Riconcatenate nell'ordine [past | standard] identico a prima → trainer/eval invariati.
+        # con use_past_class_head le past-query usano past_class_embed
         if self.past_class_embed is not None and (self.phase == 1 or query_mode in ('both', 'past_only')):
             if query_mode == 'both' and self.phase == 2:
                 N = past_boxes.shape[1]                       # slot passato = [0:N], standard = [N:]
@@ -589,15 +552,13 @@ class MultiDurationRTDetrAttention(nn.Module):
                     branch.class_embed[-1](hidden_states[:, N:]),
                 ], dim=1)
             else:
-                # solo past query (phase 1 oppure phase 2 'past_only'): tutte le hs sono past
+                # solo past query
                 logits = self.past_class_embed(hidden_states)
         else:
             logits = branch.class_embed[-1](hidden_states)
-        pred_boxes= branch.bbox_embed[-1](hidden_states).sigmoid() # produce le box in coord 0,1 con la sigmoid (bbox condivisa)
+        pred_boxes= branch.bbox_embed[-1](hidden_states).sigmoid() # produce le box in coord 0,1 con la sigmoid
 
-        # RT-DETR deep supervision: predizioni per OGNI layer del decoder (aux-loss ufficiale).
-        # Solo quando servono le query standard e auxiliary_loss è attivo → costo nullo per past_only/phase1.
-        # NB: copre TUTTE le Q (in 'both' = [past | standard]); per la loss standard il trainer usa lo slice standard.
+        # deep supervision RT-DETR: predizioni di ogni layer del decoder
         intermediate_logits = None
         intermediate_boxes = None
         if use_standard and getattr(self.config, 'auxiliary_loss', False) \
@@ -611,21 +572,16 @@ class MultiDurationRTDetrAttention(nn.Module):
             intermediate_logits = torch.stack(_il, dim=1)   # (B, L, Q, num_labels)
             intermediate_boxes  = torch.stack(_ib, dim=1)   # (B, L, Q, 4)
 
-        # Forecasting + present-refinement (Proposta C): SOLO sugli slot query-passato.
-        # Il forecasting è definito solo per i droni tracciati (query-passato); in
-        # standard_only non ci sono passati → si salta del tutto.
+        # forecasting e present refinement solo sulle query-passato (le prime N)
         future_boxes = None
         present_refined = None
         num_past_q = past_boxes.shape[1]                          # N (past_boxes = past_boxes_proj)
         run_forecast = (
             self.forecasting_head is not None
-            and num_past_q > 0                                    # N=0 → nessun drone da forecast/refine (seq vuota)
+            and num_past_q > 0
             and (self.phase == 1 or query_mode in ('both', 'past_only'))
         )
         if run_forecast:
-            # Fix 1.A: la head opera SOLO sui primi N = query-passato (reali + fake), non su
-            # tutte le Q. In phase 1 hidden_states è già (B, N, D); in phase 2 'both' le
-            # query-passato sono le prime N (ordine [past, standard]).
             hs_past = hidden_states[:, :num_past_q]               # (B, N, D)
             pb_past = pred_boxes[:, :num_past_q]                  # (B, N, 4)
 
@@ -653,6 +609,7 @@ class MultiDurationRTDetrAttention(nn.Module):
             enc_topk_bboxes=enc_topk_bboxes,
             intermediate_logits=intermediate_logits,
             intermediate_boxes=intermediate_boxes,
+            hidden_states=hidden_states,
         )
 
     def forward(
@@ -697,10 +654,7 @@ class MultiDurationRTDetrAttention(nn.Module):
         past_boxes_proj = self.past_encoder(past_boxes) # (B, N, D)
         last_ref_points = past_boxes[:, :, 0, :] # (B, N, 4) da viz_collate p_idx=0 e lo step più recente
 
-        # Velocità per l'ancora CV del forecasting, MEDIATA su k step (meno rumore del 2-frame):
-        # v = (box più recente − box a k step fa) / k. p_idx=0 = più recente. (None se P<2 o no forecasting)
-        # Con use_cv_anchor=False la velocità NON viene calcolata → past_velocity=None →
-        # _cv_anchor ritorna il solo presente → future = present + delta (no ancora CV).
+        # velocità per l'ancora CV, media sugli ultimi k step (p_idx=0 = più recente)
         past_velocity = None
         if self.forecasting_head is not None and self.use_cv_anchor and past_boxes.shape[2] >= 2:
             k = max(1, min(self.vel_avg_k, past_boxes.shape[2] - 1))   # 1..P-1

@@ -212,8 +212,7 @@ def parse_annotations_coco(annotations, width, height):
 
 
 def frame_key(window):
-    """Chiave stabile di un frame (sequenza, fine finestra in µs), indipendente da subsample e split:
-    collega i sample del training alla cache del passato closed-loop (train/closed_loop_cache.py)."""
+    """(sequenza, fine finestra in µs): chiave del frame nella cache closed-loop."""
     return (window['hdf5_path'], int(window['window_end_time']))
 
 
@@ -262,12 +261,8 @@ def parse_annotations_normalized(annotations, width, height):
 
 @njit(cache=True)
 def render_time_surface_numba(x, y, p, age_us, tau_us, height, width):
-    """Time-surface HOTS (Lagorce et al., IEEE TPAMI 2017) — formula UFFICIALE, per-polarita.
-        S_p(x,y) = exp(-(t_ref - T_p(x,y)) / tau)
-    con t_ref = tempo di riferimento (fine finestra), T_p = tempo dell'ULTIMO evento di polarita p
-    sul pixel, tau = costante di decadimento. Qui age_us[i] = (t_ref - t_i) in MICROSECONDI (>=0)
-    e tau_us in microsecondi. Uscita 3 canali: [S_on, S_off, 0] (2 canali HOTS + zero-pad per il
-    backbone RGB pre-allenato)."""
+    """Time surface HOTS per polarita: S_p = exp(-(t_ref - T_p) / tau), canali [S_on, S_off, 0].
+    age_us = t_ref - t in µs."""
     min_age_pos = np.full((height, width), -1.0, dtype=np.float32)   # eta' (µs) ultimo ON, -1 = assente
     min_age_neg = np.full((height, width), -1.0, dtype=np.float32)   # eta' (µs) ultimo OFF
     for i in range(len(x)):
@@ -276,7 +271,7 @@ def render_time_surface_numba(x, y, p, age_us, tau_us, height, width):
         if 0 <= xi < width and 0 <= yi < height:
             a = age_us[i]
             if p[i] > 0:
-                if min_age_pos[yi, xi] < 0.0 or a < min_age_pos[yi, xi]:   # ULTIMO evento = eta' minore
+                if min_age_pos[yi, xi] < 0.0 or a < min_age_pos[yi, xi]:   # ultimo evento = eta' minore
                     min_age_pos[yi, xi] = a
             else:
                 if min_age_neg[yi, xi] < 0.0 or a < min_age_neg[yi, xi]:
@@ -295,11 +290,7 @@ def render_time_surface_numba(x, y, p, age_us, tau_us, height, width):
 
 @njit(cache=True)
 def render_tencode_numba(x, y, p, age_us, height, width):
-    """TENCODE (Huang et al., WACV 2023) — formula UFFICIALE, 3 canali RGB.
-        on-event : (R,G,B) = (1, (t_max - t)/(t_max - t_min), 0)
-        off-event: (R,G,B) = (0, (t_max - t)/(t_max - t_min), 1)
-    Per ogni pixel vince l'ULTIMO evento. G = eta' normalizzata sullo span: newest -> 0, oldest -> 1
-    (in eta': age_min -> 0, age_max -> 1). age_us[i] = (t_ref - t_i) in µs."""
+    """TENCODE (Huang et al., WACV 2023): R = ON, B = OFF, G = eta' normalizzata dell'ultimo evento."""
     n = len(x)
     amin = age_us[0]                                   # span delle eta' per normalizzare G
     amax = age_us[0]
@@ -341,17 +332,13 @@ class EventFrameRenderer:
         self.width = width
         self.height = height
         self.render_mode = render_mode
-        # tau del time-surface HOTS come FRAZIONE della durata finestra: tau_d = ts_tau_frac * durata_d.
-        # Per-scala -> ogni durata (33/165/330ms) mostra la sua scia (un tau FISSO farebbe sparire la
-        # scia delle finestre lunghe). Decadimento = exp() ufficiale HOTS; riporta ts_tau_frac nel paper.
+        # tau del time surface = ts_tau_frac * durata della finestra
         self.ts_tau_frac = ts_tau_frac
         self.num_channels = 1 if render_mode == 'delta' else 3
 
     def render(self, x, y, p, t=None, tau_us=None):
         """Render events to frame based on render_mode.
-        t = ETA' dell'evento in MICROSECONDI rispetto alla fine finestra (t_ref - t_evento, >=0);
-        tau_us = tau del time-surface in µs (per-scala, passato dal chiamante). Servono alle
-        modalita temporali (time_surface HOTS, tencode); le altre li ignorano."""
+        t (eta' in µs) e tau_us servono solo a time_surface e tencode."""
         if len(x) == 0:
             if self.render_mode == 'delta':
                 return np.zeros((self.height, self.width), dtype=np.float32)
@@ -672,8 +659,8 @@ class FREDMultiDurationDataset(Dataset):
                 t_start = t_end - duration_us
                 mask = t_all >= t_start
                 tm = t_all[mask]
-                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None   # eta' in µs (t_ref = fine finestra)
-                tau_us = self.renderer.ts_tau_frac * duration_us   # tau per-scala = frazione della durata
+                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None   # eta' in µs
+                tau_us = self.renderer.ts_tau_frac * duration_us
                 frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask], age, tau_us)
                 images[duration_us // 1000] = self.renderer.to_pil(frame)
         else:
@@ -856,11 +843,9 @@ class FREDMultiDurationTensorDatasetTracking(Dataset):
             for duration_us in self._duration_us:
                 t_start = t_end - duration_us
                 mask = t_all >= t_start
-                # eta' dell'evento in µs rispetto alla FINE finestra (t_ref - t): usata dalle
-                # modalita temporali (time_surface HOTS / tencode). None se finestra vuota.
                 tm = t_all[mask]
-                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None
-                tau_us = self.renderer.ts_tau_frac * duration_us   # tau per-scala = frazione della durata
+                age = (t_end - tm.astype(np.int64)).astype(np.float32) if len(tm) else None   # eta' in µs
+                tau_us = self.renderer.ts_tau_frac * duration_us
                 frame = self.renderer.render(x_all[mask], y_all[mask], p_all[mask], age, tau_us)
                 frames[duration_us // 1000] = self.renderer.to_tensor(frame)
         else:
@@ -881,7 +866,7 @@ class FREDMultiDurationTensorDatasetTracking(Dataset):
             'boxes': torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4), dtype=torch.float32),
             'labels': torch.tensor(labels, dtype=torch.int64) if labels else torch.zeros((0,), dtype=torch.int64),
             'ids': torch.tensor(ids, dtype=torch.int64) if ids else torch.zeros((0,), dtype=torch.int64),
-            'frame_key': frame_key(window),   # per il passato closed-loop del training curriculum (use_self_past)
+            'frame_key': frame_key(window),   # usato da use_self_past
         }
 
         # Add past annotations

@@ -147,9 +147,7 @@ class BaseTrainer(ABC):
             
             import wandb
 
-            # wandb scrive la sua cartella locale in <wandb_path>/wandb/ e può crescere
-            # parecchio: assicuriamoci che la dir esista e NON stia su un filesystem pieno
-            # (con wandb_path='../' finiva accanto al progetto → /andromeda, saturo).
+            # cartella locale di wandb: <wandb_path>/wandb/
             wandb_dir = self.config.wandb_path
             os.makedirs(wandb_dir, exist_ok=True)
             print(f"[dirs] wandb_dir      : {os.path.join(wandb_dir, 'wandb')}")
@@ -386,13 +384,12 @@ class BaseTrainer(ABC):
             'best_val_loss': self.best_val_loss,
             'global_step': getattr(self, 'global_step', 0),
             'patience_counter': getattr(self, 'patience_counter', 0),
-            'self_past_state': getattr(self, 'self_past_state', None),   # rampa del training curriculum
+            'self_past_state': getattr(self, 'self_past_state', None),   # stato del curriculum closed-loop
         }
         if getattr(self, 'scheduler', None) is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
-        # Early-warning spazio disco (non blocca). NB: la QUOTA per-utente del cluster NON
-        # è visibile via shutil.disk_usage/statvfs — questo copre solo il disco fisico pieno.
+        # avviso se il disco è quasi pieno (la quota per utente non si vede da qui)
         try:
             free_gb = shutil.disk_usage(self.checkpoint_dir).free / (1024 ** 3)
             min_gb = float(getattr(self.config, 'min_free_gb_checkpoint', 2.0))
@@ -402,7 +399,7 @@ class BaseTrainer(ABC):
         except Exception:
             pass
 
-        # last_checkpoint.pt: salvato SEMPRE (ogni epoca), sovrascritto → resume dall'ultima epoca.
+        # last_checkpoint.pt: sovrascritto a ogni epoca
         last_path = os.path.join(self.checkpoint_dir, "last_checkpoint.pt")
         torch.save(checkpoint, last_path)
 
@@ -417,8 +414,7 @@ class BaseTrainer(ABC):
         """Load a checkpoint to resume training."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        # ── Controllo chiavi/shape: intercetta un checkpoint di ARCHITETTURA diversa
-        #    (es. testa forecasting cambiata dopo il salvataggio) prima di caricare. ──
+        # controllo chiavi/shape prima di caricare (architettura diversa)
         ckpt_sd = checkpoint['model_state_dict']
         model_sd = self.model.state_dict()
         ckpt_keys, model_keys = set(ckpt_sd.keys()), set(model_sd.keys())
@@ -461,10 +457,10 @@ class BaseTrainer(ABC):
                         if k in model_keys and tuple(model_sd[k].shape) == tuple(ckpt_sd[k].shape)}
             self.model.load_state_dict(filtered, strict=False)
         else:
-            self.model.load_state_dict(ckpt_sd, strict=True)   # match esatto → load pulito
+            self.model.load_state_dict(ckpt_sd, strict=True)
             print("[resume] ✓ tutte le chiavi combaciano — load esatto")
 
-        # Optimizer: se l'architettura è diversa i param-group non combaciano → non far crashare il resume
+        # optimizer: con architettura diversa si riparte da zero
         try:
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except Exception as e:
@@ -479,8 +475,7 @@ class BaseTrainer(ABC):
         if checkpoint.get('self_past_state') is not None:
             self.self_past_state = checkpoint['self_past_state']
 
-        # Ripristino dello scheduler (LR). Se il checkpoint non lo contiene (versione
-        # vecchia), fast-forward al punto di ripresa così l'LR è coerente.
+        # scheduler: se manca nel checkpoint, fast-forward all'epoca di ripresa
         if getattr(self, 'scheduler', None) is not None:
             if 'scheduler_state_dict' in checkpoint:
                 self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])

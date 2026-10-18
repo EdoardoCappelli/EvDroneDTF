@@ -1,8 +1,7 @@
 """
-TrackTrack-AR: tracker per l'inferenza closed-loop di Drone-OFA.
+TrackTrack-AR: tracker per l'inferenza closed-loop.
 
-Reference: TrackTrack — K. Shim, K. Ko, Y. Yang, C. Kim, "Focusing on Tracks for Online
-Multi-Object Tracking", CVPR 2025 (SOTA training-free su MOT17, MOT20 e DanceTrack).
+Basato su TrackTrack (Shim et al., "Focusing on Tracks for Online Multi-Object Tracking", CVPR 2025).
 """
 
 from collections import deque
@@ -13,12 +12,9 @@ NEW, TRACKED, LOST, REMOVED = 0, 1, 2, 3
 STATE_NAME = {NEW: "new", TRACKED: "tracked", LOST: "lost", REMOVED: "removed"}
 
 
-# ══════════════════════════════════════════════════════════════════════════════════════════
-# Configurazione
-# ══════════════════════════════════════════════════════════════════════════════════════════
 @dataclass
 class TTConfig:
-    use_past: bool = True        # False → nessuna query-passato (tracking-by-detection puro)
+    use_past: bool = True        # False = senza query-passato
     # candidati
     low_thr: float = 0.10        # sotto: scartato
     det_thr: float = 0.50        # alta / bassa confidenza
@@ -30,13 +26,11 @@ class TTConfig:
     penalty_del: float = 0.40    # TrackTrack: penalty_q
     iou_gate: float = 0.10       # IoU delle box allargate sotto la soglia → coppia vietata
     buffer: float = 0.30         # margine base della buffered IoU (frazione di w e h per lato)
-    buffer_new: float = 1.00     # margine di un track con una sola osservazione (velocità ignota):
-                                 # un drone piccolo e veloce si sposta anche di 1-2 box fra due frame
-    buffer_speed: float = 1.00   # margine aggiunto per ogni box/frame di velocità (per asse)
-    buffer_lost: float = 0.10    # margine aggiunto per ogni frame perso (incertezza che cresce)
-    buffer_max: float = 1.50     # tetto del margine adattivo
-    hmiou: bool = False          # True = costo HMIoU di TrackTrack (HIoU·IoU, pensato per pedoni sullo
-                                 # stesso piano); False = 1 − IoU: i droni si muovono anche in verticale
+    buffer_new: float = 1.00     # margine per un track con una sola osservazione
+    buffer_speed: float = 1.00   # margine aggiunto per box/frame di velocità
+    buffer_lost: float = 0.10    # margine aggiunto per frame perso
+    buffer_max: float = 1.50     # tetto del margine
+    hmiou: bool = False          # True = costo HMIoU di TrackTrack, False = 1 - IoU
     w_iou: float = 0.50
     w_app: float = 0.0           # >0 solo se il modello restituisce gli embedding
     w_conf: float = 0.10
@@ -44,24 +38,22 @@ class TTConfig:
     past_bonus: float = 0.20     # slot passato i → track i
     past_cross: float = 0.20     # slot passato i → altri track
     delta_t: int = 3             # orizzonte per la direzione del moto
-    kf_vel: float = 1.0 / 160.0  # rumore di processo della velocità del Kalman (× w,h per frame)
+    kf_vel: float = 1.0 / 160.0  # rumore di processo della velocità del Kalman
     # TAI e ciclo di vita
     init_thr: float = 0.65       # score minimo per far nascere un track
     tai_track_thr: float = 0.30  # buffered IoU max con un track attivo per nascere
     tai_det_thr: float = 0.55    # buffered IoU max con una detection più sicura (TrackTrack: tai_thr)
-    min_hits: int = 2            # osservazioni prima di uscire NEW → TRACKED (in output)
-    new_patience: int = 0        # frame persi tollerati da un track NEW (TrackTrack: 0)
+    min_hits: int = 2            # osservazioni prima di passare a TRACKED
+    new_patience: int = 0        # frame persi tollerati da un track NEW
     max_lost: int = 30           # frame persi prima della rimozione
-    track_nms_thr: float = 0.45  # buffered IoU fra due track aggiornati oltre cui resta il più vecchio (0 = off)
+    track_nms_thr: float = 0.45  # NMS fra track aggiornati (0 = off)
     # query-passato
     query_lost: int = 6          # un track perso resta query-passato per questi frame
     query_conf: float = 0.50     # score medio minimo delle osservazioni reali nella finestra
-    coher_thr: float = 0.10      # coerenza minima di ogni passo della finestra (vedi _window_stats)
+    coher_thr: float = 0.10      # coerenza minima fra box consecutive della finestra
     interp_gaps: bool = True     # al ritorno, le box previste del buco diventano interpolazione
-    output_new: bool = False     # emetti anche i track NEW (prima di min_hits)
-    out_thr: float = 0.65        # in output (metriche, MOT, video) solo osservazioni con score ≥ out_thr: quelle
-                                 # più basse tengono vivo il track ma non escono. 0.65 = AR_CONF_THR dello script
-                                 # di run (soglia del legacy); 0 = emetti tutto. Non cambia il ciclo chiuso
+    output_new: bool = False     # emetti anche i track NEW
+    out_thr: float = 0.65        # score minimo delle box emesse (0 = tutte)
 
     @classmethod
     def from_config(cls, config, prefix="ar_tt_"):
@@ -74,9 +66,7 @@ class TTConfig:
         return cls(**kw)
 
 
-# ══════════════════════════════════════════════════════════════════════════════════════════
-# Geometria (vettoriale; box cxcywh normalizzate in ingresso)
-# ══════════════════════════════════════════════════════════════════════════════════════════
+# geometria (box cxcywh normalizzate)
 def cxcywh_to_xyxy(b):
     b = np.asarray(b, dtype=np.float64).reshape(-1, 4)
     return np.stack([b[:, 0] - b[:, 2] / 2, b[:, 1] - b[:, 3] / 2,
@@ -84,14 +74,14 @@ def cxcywh_to_xyxy(b):
 
 
 def expand(xyxy, bx, by):
-    """Box allargate di bx × larghezza a sinistra e a destra, by × altezza sopra e sotto."""
+    """Box allargate di bx volte la larghezza e by volte l'altezza per lato."""
     w = (xyxy[:, 2] - xyxy[:, 0])[:, None]
     h = (xyxy[:, 3] - xyxy[:, 1])[:, None]
     return xyxy + np.concatenate([-bx * w, -by * h, bx * w, by * h], axis=1)
 
 
 def buffered(xyxy, buf):
-    """C-BIoU: ogni lato allargato di buf × dimensione della box."""
+    """C-BIoU: box allargate di buf per lato."""
     return xyxy if buf <= 0 or len(xyxy) == 0 else expand(xyxy, buf, buf)
 
 
@@ -126,14 +116,14 @@ def height_iou(a, b):
 
 
 def _median0(a):
-    """Mediana per colonne (come np.median(a, axis=0)) per array piccoli, senza l'overhead di np.median."""
+    """Mediana per colonne, più veloce di np.median su array piccoli."""
     s = np.sort(a, axis=0)
     n = len(s)
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
 
 
 def _greedy_keep(iou, thr):
-    """NMS greedy su una matrice IoU già ordinata per score decrescente → maschera dei tenuti."""
+    """NMS greedy su una matrice IoU ordinata per score: maschera delle box tenute."""
     keep = np.ones(len(iou), dtype=bool)
     for i in range(len(iou)):
         if keep[i]:
@@ -142,8 +132,7 @@ def _greedy_keep(iou, thr):
 
 
 def nms(xyxy, scores, thr, *more_thr):
-    """NMS greedy: tiene le box in ordine di score, scarta quelle con IoU > thr con una tenuta.
-    Con più soglie usa UNA sola matrice IoU e ritorna una lista di keep per soglia."""
+    """NMS greedy; con più soglie ritorna gli indici tenuti per ciascuna."""
     order = np.argsort(-scores)
     iou = iou_matrix(xyxy[order], xyxy[order])
     out = [[int(order[i]) for i in np.flatnonzero(_greedy_keep(iou, th))] for th in (thr,) + more_thr]
@@ -151,9 +140,7 @@ def nms(xyxy, scores, thr, *more_thr):
 
 
 def tpa_match(cost, thr, step):
-    """Track-Perspective-Based Association (TrackTrack): a ogni giro entrano le coppie che sono il
-    minimo sia della riga (track) sia della colonna (candidato) con costo < soglia; poi righe e
-    colonne usate vengono escluse e la soglia si stringe di `step`. Si ferma quando un giro è vuoto."""
+    """Track-Perspective-Based Association: a ogni giro si accoppiano i minimi reciproci sotto soglia."""
     cost = cost.copy()
     matches = []
     if cost.size == 0:
@@ -171,9 +158,7 @@ def tpa_match(cost, thr, step):
             cost[:, j] = 1.0
 
 
-# ══════════════════════════════════════════════════════════════════════════════════════════
-# Kalman a velocità costante con rumore adattivo allo score (NSA), su cxcywh normalizzate
-# ══════════════════════════════════════════════════════════════════════════════════════════
+# Kalman a velocità costante, rumore adattivo allo score (NSA)
 class KalmanNSA:
     std_pos, std_vel = 1.0 / 20.0, 1.0 / 160.0
     F = np.eye(8)
@@ -187,9 +172,7 @@ class KalmanNSA:
 
     @classmethod
     def initiate(cls, z):
-        # come il KalmanFilter ufficiale di TrackTrack: std 2·(w,h) sulla posizione e 10·(w,h) sulla
-        # velocità → la seconda osservazione fissa la velocità (quella di ByteTrack, 10/160·(w,h),
-        # la tiene ~0 e un drone veloce non viene più agganciato)
+        # incertezza iniziale come in TrackTrack: 2*(w,h) sulla posizione, 10*(w,h) sulla velocità
         mean = np.r_[z, np.zeros(4)]
         s = cls._scale(mean)
         return mean, np.diag(np.r_[2.0 * s, 10.0 * s] ** 2)
@@ -210,12 +193,8 @@ class KalmanNSA:
         return mean, cov - K @ S @ K.T
 
 
-# ══════════════════════════════════════════════════════════════════════════════════════════
-# Track
-# ══════════════════════════════════════════════════════════════════════════════════════════
 class TTrack:
-    """Un drone. `boxes` è la finestra di P box che diventa la query-passato (reali + previste,
-    indice 0 = la più vecchia, come il Track storico: le visualizzazioni la leggono uguale)."""
+    """Un drone; `boxes` è la finestra di P box (reali e previste) usata come query-passato, indice 0 = la più vecchia."""
 
     def __init__(self, tid, box, score, frame, P, emb=None, kind="high"):
         box = np.array(box, dtype=np.float64)
@@ -239,8 +218,7 @@ class TTrack:
     # -- moto ----------------------------------------------------------------------------------
     def predict(self, frame, std_vel=None):
         self.kf_mean, self.kf_cov = KalmanNSA.predict(self.kf_mean, self.kf_cov, std_vel)
-        # forecast appreso finché nessuna osservazione è più recente del frame in cui è stato prodotto
-        # (track perso: previsione a più passi); altrimenti il Kalman, che ha già l'osservazione nuova
+        # forecast appreso se non ci sono osservazioni più recenti, altrimenti Kalman
         k = None if self.fc is None or self.obs[-1][0] > self.fc_frame else frame - self.fc_frame - 1
         if k is not None and 0 <= k < len(self.fc):
             self.pred = np.asarray(self.fc[k], dtype=np.float64).copy()
@@ -269,8 +247,7 @@ class TTrack:
         return v
 
     def velocity(self, delta_t):
-        """Velocità dei centri per frame dalle osservazioni reali (ultima vs quella di delta_t frame
-        prima o la più vecchia disponibile): robusta al rumore di una singola box, segue le virate."""
+        """Velocità dei centri per frame fra l'ultima osservazione e quella di delta_t frame prima."""
         key = ("v", delta_t)
         if key not in self._dir:
             v = np.zeros(2)
@@ -320,7 +297,7 @@ class TTrack:
             self.state = TRACKED
 
     def miss(self):
-        """Nessun candidato: la finestra prosegue con la box prevista (resta a passo 33 ms)."""
+        """Frame senza candidato: la finestra prosegue con la box prevista."""
         self.lost += 1
         if self.state == TRACKED:
             self.state = LOST
@@ -332,17 +309,14 @@ class TTrack:
 
     # -- query-passato -----------------------------------------------------------------------------
     def _window_stats(self, cfg):
-        """(score medio delle osservazioni reali nella finestra, coerenza minima fra box consecutive):
-        ricalcolati solo quando la finestra cambia. Coerenza di un passo = buffered IoU con la box
-        precedente oppure, se più alta, con la sua estrapolazione a velocità costante: un drone veloce
-        che si sposta più della propria dimensione resta coerente, un salto su un altro oggetto no."""
+        """(score medio delle osservazioni reali, coerenza minima fra box consecutive), in cache."""
         if self._win is None:
             real = [s for s, r in zip(self.scores, self.real) if r]
             mean = float(np.mean(real)) if real else -np.inf
             coh = np.inf
             if len(self.boxes) > 1:
                 bx = np.stack(self.boxes)
-                # margine come nell'associazione: base + velocità (mediana dei passi, robusta a un salto)
+                # margine come nell'associazione
                 spd = _median0(np.abs(np.diff(bx[:, :2], axis=0))) / np.maximum(_median0(bx[:, 2:]), 1e-4)
                 mx, my = np.minimum(cfg.buffer + cfg.buffer_speed * spd, max(cfg.buffer, cfg.buffer_max))
                 xy = expand(cxcywh_to_xyxy(bx), mx, my)
@@ -372,20 +346,8 @@ class TTrack:
         return np.stack(list(self.boxes)[::-1], axis=0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════════════════
-# Tracker
-# ══════════════════════════════════════════════════════════════════════════════════════════
 class TrackTrackAR:
-    """Uso per frame (batch = 1, frame consecutivi della stessa sequenza):
-
-        q = tracker.query_tracks()                       # track → query-passato, in ordine di slot
-        past = tracker.query_array(q)                    # (N, P, 4) cxcywh, indice 0 = più recente
-        ... forward del modello con N query-passato + Q_s standard ...
-        dets, src = tracker.step(past_b, past_s, std_b, std_s, q, future)
-        # dets: [(box cxcywh, score, track_id)], src: 'past' | 'standard' per detection
-
-    `future` (N, T, 4): forecast degli slot passato (opzionale). Al cambio di sequenza: reset().
-    """
+    """Per frame: q = query_tracks(); past = query_array(q); forward; step(...). Al cambio di sequenza: reset()."""
 
     def __init__(self, cfg: TTConfig, P: int):
         self.cfg, self.P = cfg, int(P)
@@ -420,10 +382,7 @@ class TrackTrackAR:
 
     # -- costo --------------------------------------------------------------------------------------
     def _buffer(self, t):
-        """Margine C-BIoU del track per asse (bx, by), in frazioni della box: base, più la velocità
-        osservata in box/frame (l'errore di previsione cresce con la velocità: un drone lento resta
-        preciso, uno veloce viene associato con tolleranza), largo finché la velocità è ignota (una sola
-        osservazione), e cresce con i frame persi."""
+        """Margine C-BIoU per asse: base più velocità osservata; largo per i track nuovi, cresce coi frame persi."""
         cfg = self.cfg
         if t.hits < 2:
             bx = by = max(cfg.buffer, cfg.buffer_new)
@@ -444,7 +403,7 @@ class TrackTrackAR:
             return np.ones((nt, nc))
         pxy = cxcywh_to_xyxy(np.array([t.pred for t in tracks]))
         dxy = cxcywh_to_xyxy(np.array([c["box"] for c in cands]))
-        # margine del track i applicato sia alla sua previsione sia a tutti i candidati (riga i)
+        # margine del track applicato alla previsione e ai candidati
         B = np.array([self._buffer(t) for t in tracks])            # (nt, 2): bx, by
         bx, by = B[:, 0:1], B[:, 1:2]
         pw, ph = (pxy[:, 2] - pxy[:, 0])[:, None], (pxy[:, 3] - pxy[:, 1])[:, None]
@@ -463,18 +422,18 @@ class TrackTrackAR:
             hi = np.minimum(pb[:, None, 3], db[..., 3]) - np.maximum(pb[:, None, 1], db[..., 1])
             hu = np.maximum(pb[:, None, 3], db[..., 3]) - np.minimum(pb[:, None, 1], db[..., 1])
             hiou = np.clip(hi, 0.0, None) / np.maximum(hu, 1e-12)
-        d_geo = 1.0 - hiou * iou                                    # 1 − IoU  (o HMIoU di TrackTrack)
+        d_geo = 1.0 - hiou * iou
         d_app, w_app = 0.0, 0.0
         if cfg.w_app > 0 and all(t.emb is not None for t in tracks) and all(c["emb"] is not None for c in cands):
             te = np.stack([t.emb for t in tracks])
             ce = np.stack([c["emb"] / max(np.linalg.norm(c["emb"]), 1e-12) for c in cands])
             d_app, w_app = np.clip(1.0 - te @ ce.T, 0.0, 1.0), cfg.w_app
         cost = (cfg.w_iou * d_geo + w_app * d_app) / (cfg.w_iou + w_app)
-        # confidenza: score previsto (proiezione lineare) vs score del candidato
+        # confidenza: score previsto contro score del candidato
         s_hat = np.clip(np.array([2 * t.score - t.prev_score for t in tracks]), 0.0, 1.0)
         s_c = np.array([c["score"] for c in cands])
         cost += cfg.w_conf * np.abs(s_hat[:, None] - s_c[None, :])
-        # direzione del moto (OC-SORT): angolo fra il moto del track e il verso verso il candidato
+        # direzione del moto (OC-SORT)
         if cfg.w_angle > 0:
             cc = np.array([c["box"][:2] for c in cands])
             for i, t in enumerate(tracks):
@@ -485,8 +444,7 @@ class TrackTrackAR:
                 n = np.linalg.norm(u, axis=1)
                 cosang = np.where(n > 1e-9, (u @ v) / np.maximum(n, 1e-9), 1.0)
                 cost[i] += cfg.w_angle * np.arccos(np.clip(cosang, -1, 1)) / np.pi * s_c
-        # penalità per tipo di candidato (anche uno slot passato poco sicuro paga come una detection
-        # bassa), legame slot passato ↔ proprio track
+        # penalità per tipo di candidato, bonus allo slot passato del proprio track
         kind = np.array([c["kind"] for c in cands])
         past = kind == "past"
         cost[:, (kind == "low") | (past & (s_c <= cfg.det_thr))] += cfg.penalty_low
@@ -533,7 +491,7 @@ class TrackTrackAR:
                 if k not in keep_set and std_s[sel[k]] > cfg.det_thr:
                     cands.append(self._cand(std_b, std_s, std_emb, sel[k], "del"))
 
-        # TPA, stadio 1: track attivi + persi contro TUTTI i candidati
+        # TPA, stadio 1: track attivi e persi contro tutti i candidati
         act = [t for t in self.tracks if t.state in (TRACKED, LOST)]
         used = set()
         for i, j in tpa_match(self._cost(act, cands), cfg.match_thr, cfg.reduce_step):
@@ -569,9 +527,7 @@ class TrackTrackAR:
                 self.stats["removed"] += 1
         self.tracks = [t for t in self.tracks if t.state != REMOVED]
 
-        # NMS fra track aggiornati in questo frame: resta il più vecchio. Qui e nella TAI le box dello
-        # stesso frame si confrontano con la buffered IoU (margine base): per un drone di pochi pixel due
-        # detection dello stesso oggetto possono avere IoU semplice < 0.3 per un paio di pixel di scarto
+        # NMS fra track aggiornati in questo frame (buffered IoU): resta il più vecchio
         if cfg.track_nms_thr > 0:
             upd = sorted((t for t in self.tracks if t.lost == 0), key=lambda x: x.track_id)
             if len(upd) > 1:

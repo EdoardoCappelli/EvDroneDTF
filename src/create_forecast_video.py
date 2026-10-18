@@ -1,21 +1,7 @@
 """
-create_forecast_video.py — video del FORECASTING (traiettoria futura).
-
-Per la clip scelta disegna, ad ogni frame:
-  - GT presente (verde solido) + detection presente del modello (arancione solido)
-  - traiettoria FUTURA GT (verde tratteggiato, fade nel tempo)
-  - traiettoria FUTURA PREDETTA dalla testa forecasting (arancione tratteggiato)
-
-Due modalità di PASSATO (una per video):
-  --autoregressive 0  → passato ORACLE (GT)         → forecast dal passato vero
-  --autoregressive 1  → passato AUTOREGRESSIVO      → il passato lo ricostruisce il tracker
-
-Richiede un checkpoint con la testa forecasting (es. joint_scratch_p12_fakepast).
-
-⚠️ Script NUOVO (non testato in locale: niente GPU/dati qui). Se qualcosa non torna, il primo
-   sospetto è il caricamento del checkpoint (chiavi mancanti > testa forecasting) o il num_future.
-
-Riusa gli helper di create_detection_video.py (disegni, tracker, collate del passato).
+Video del forecasting: GT e detection del presente, traiettoria futura GT e predetta.
+--autoregressive 0 usa il passato GT, 1 il passato ricostruito dal tracker.
+Richiede un checkpoint con la forecasting head.
 """
 import argparse
 import json
@@ -35,25 +21,18 @@ from models.Multiscale_ERT_Detr import MultiDurationRTDetrAttention
 from data.datasets.event_dataset_forecasting import FREDMultiDurationTensorDatasetTracking
 from create_detection_video import (
     _make_multi_fig, _draw_box, _fig_to_bgr,
-    Track, best_match_track, box_iou_cxcywh,
+    Track, best_match_track, box_iou_cxcywh, nms_std, duplicate_tracks,
+    add_tracker_args, make_tracktrack,
     scan_segments, build_collate,
     C_PRESENT_GT, C_PRED, C_TRACK_USED, C_PAST_GT,
 )
 
-C_FORECAST = '#00e5ff'   # ciano: forecast futuro (distinto dall'arancione della detection presente)
+C_FORECAST = '#00e5ff'   # forecast
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SPLIT — gira su uno split diverso (es. challenging) SENZA ri-preprocessare gli HDF5.
-# Come make_split_index.py: la cartella-sequenza di una finestra è
-#   hdf5_path = .../{folder}/Event/events.hdf5  →  folder = basename(dirname(dirname(...)))
-# Uno split è un .txt di cartelle. Le sequenze del challenging-test stanno in ENTRAMBE le
-# partizioni canonical (train+test) → si fa POOL di train+test e poi si filtra, così non si
-# perdono le sequenze che nel canonical erano nel train.
-# ══════════════════════════════════════════════════════════════════════════════
+# split diverso (es. challenging): pool di train+test filtrato con il .txt
 def build_split_index(preprocessed_dir: str, acc_ms: int, split_txt: str) -> str:
-    """Pool train+test del preprocessed, tiene le finestre delle cartelle elencate in split_txt,
-    scrive un JSON temporaneo (metadati canonici) e ne ritorna il path (da passare come index_file)."""
+    """Scrive un index temporaneo con le finestre delle cartelle in split_txt e ne ritorna il path."""
     with open(split_txt) as f:
         want = {ln.strip().strip('/').strip() for ln in f if ln.strip()}
 
@@ -86,13 +65,8 @@ def build_split_index(preprocessed_dir: str, acc_ms: int, split_txt: str) -> str
     return tmp.name
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COLLATE — riusa il collate detection per il passato, aggiunge il futuro GT
-# ══════════════════════════════════════════════════════════════════════════════
 def build_collate_forecast(image_processor, num_past: int, num_future: int):
-    """Come build_collate (frames/present/past) + future_gt/future_mask (1, n_present, T, 4).
-    future_gt è indicizzato per drone PRESENTE (target['ids']); per ogni step futuro trova la box
-    dello stesso id (mask=False dove il drone non c'è in quello step)."""
+    """build_collate + future_gt/future_mask (1, n_present, T, 4) dei droni presenti."""
     base = build_collate(image_processor, num_past)
 
     def collate(batch):
@@ -117,9 +91,6 @@ def build_collate_forecast(image_processor, num_past: int, num_future: int):
     return collate
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RENDER — presente (GT verde / det arancione) + futuro (GT verde-tratteg / pred arancione-tratteg)
-# ══════════════════════════════════════════════════════════════════════════════
 def render_forecast(
     frames_dict, present_labels, pred_boxes, scores, future_gt, future_mask, pred_future,
     score_thr: float, mode_label: str, frame_idx: int, img_w: int, img_h: int,
@@ -127,7 +98,7 @@ def render_forecast(
 ) -> np.ndarray:
     fig, ax = _make_multi_fig(frames_dict)
 
-    # Passato: GIALLO = track VALIDO (usato per detection+forecasting), BLU = track non ancora valido.
+    # passato: giallo = track valido, blu = non ancora valido
     if tracks is not None:                       # AR: storia di ogni track (giallo se valido)
         vset = valid_set or set()
         for t in tracks:
@@ -137,7 +108,7 @@ def render_forecast(
             for j, box in enumerate(bs):
                 a = max(0.2, 0.3 + 0.6 * j / n)
                 _draw_box(ax, box, color, img_w, img_h, '--', 1.0, a)
-    elif past_boxes is not None:                 # oracle: passato GT (tutto usato) → giallo
+    elif past_boxes is not None:                 # oracle: passato GT
         pb = past_boxes[0].detach().cpu().numpy()   # (N, P, 4)
         for i in range(pb.shape[0]):
             for p in range(pb.shape[1]):
@@ -147,7 +118,7 @@ def render_forecast(
                 a = max(0.2, 1.0 - p / max(pb.shape[1], 1) * 0.8)
                 _draw_box(ax, box, C_TRACK_USED, img_w, img_h, '--', 1.0, a)
 
-    # Presente: GT (verde solido) + detection del modello (arancione solido)
+    # presente: GT e detection
     if present_labels is not None:
         for box in present_labels[0]['boxes'].cpu().numpy():
             _draw_box(ax, box, C_PRESENT_GT, img_w, img_h, lw=2.0, label='GT')
@@ -156,7 +127,7 @@ def render_forecast(
             if sc >= score_thr:
                 _draw_box(ax, box, C_PRED, img_w, img_h, lw=2.0, label=f'{sc:.2f}')
 
-    # Futuro GT (verde tratteggiato, fade con l'orizzonte)
+    # futuro GT
     if future_gt is not None:
         fg = future_gt[0].cpu().numpy()      # (n, T, 4)
         fm = future_mask[0].cpu().numpy()    # (n, T)
@@ -166,14 +137,14 @@ def render_forecast(
                     a = max(0.15, 1.0 - t / max(fm.shape[1], 1) * 0.85)
                     _draw_box(ax, fg[i, t], C_PRESENT_GT, img_w, img_h, '--', 1.0, a)
 
-    # Futuro PREDETTO (CIANO tratteggiato, fade con l'orizzonte; ultimo step piu marcato)
+    # futuro predetto, ultimo step più marcato
     if pred_future is not None and pred_future.shape[1] > 0:
         pf = pred_future[0].cpu().numpy()    # (N, T, 4)
         T_fc = pf.shape[1]
         for i in range(pf.shape[0]):
             for t in range(T_fc):
                 a = max(0.20, 1.0 - t / max(T_fc, 1) * 0.8)
-                lw = 2.2 if t == T_fc - 1 else 1.0        # ultimo step (orizzonte lontano) piu marcato
+                lw = 2.2 if t == T_fc - 1 else 1.0
                 _draw_box(ax, pf[i, t], C_FORECAST, img_w, img_h, '--', lw, a)
 
     fig.suptitle(
@@ -195,9 +166,6 @@ def render_forecast(
     return _fig_to_bgr(fig)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}  |  past={"AR" if args.autoregressive else "oracle"}  |  T={args.num_future_steps}')
@@ -208,7 +176,7 @@ def main(args):
         image_processor.image_mean = [0.007950919680297375, 0.010960247367620468, 0.013969575986266136]
         image_processor.image_std  = [0.048023562878370285, 0.054145995527505875, 0.066846564412117]
 
-    # Modello CON testa forecasting
+    # modello con forecasting head
     model = MultiDurationRTDetrAttention(
         checkpoint='PekingU/rtdetr_v2_r18vd', num_labels=1,
         num_past_steps=args.num_past_steps, durations_ms=args.durations,
@@ -229,7 +197,7 @@ def main(args):
               "o P/durate non combaciano.")
     model.to(device).eval()
 
-    # Split diverso (es. challenging): rifiltra le finestre e usa un index temporaneo.
+    # split diverso: index temporaneo
     index_path = args.index
     if args.split_txt:
         prep_dir = args.preprocessed or os.path.dirname(os.path.abspath(args.index))
@@ -243,7 +211,7 @@ def main(args):
     )
     if args.split_txt and index_path != args.index:
         try:
-            os.remove(index_path)   # l'index è già in memoria (self.windows) → il temp non serve più
+            os.remove(index_path)   # l'index è già in memoria
         except OSError:
             pass
 
@@ -271,13 +239,18 @@ def main(args):
 
     mode_label = 'AR' if args.autoregressive else 'oracle'
     if args.autoregressive and args.std_box_priority:
-        mode_label = 'AR_stdprio'   # tag distinto → non sovrascrive il video M4
+        mode_label = 'AR_stdprio'   # nome diverso dal video di default
     out_path = args.output.replace('.mp4', f'_{mode_label}.mp4')
     raw_path = out_path.replace('.mp4', '_raw.avi')
     writer, n_written = None, 0
     tracks: list = []
     prev_seq = None
     P = args.num_past_steps
+    tt = make_tracktrack(args, P) if args.autoregressive else None   # None = tracker legacy
+    if tt is not None:
+        mode_label = 'AR_tracktrack'
+        out_path = args.output.replace('.mp4', f'_{mode_label}.mp4')
+        raw_path = out_path.replace('.mp4', '_raw.avi')
 
     for local_idx, batch in enumerate(tqdm(clip_loader, desc='Forecast video', total=end - start)):
         idx = start + local_idx
@@ -288,10 +261,16 @@ def main(args):
             seq_id = dataset.windows[idx]['hdf5_path']
             if seq_id != prev_seq:
                 tracks = []
+                if tt is not None:
+                    tt.reset()
                 prev_seq = seq_id
 
-        # ── Passato: oracle (GT) o AR (tracker) ─────────────────────────────────
-        if args.autoregressive:
+        # passato: oracle (GT) o AR (tracker)
+        if args.autoregressive and tt is not None:
+            valid = tt.query_tracks()
+            past_boxes = torch.from_numpy(tt.query_array(valid)).float().unsqueeze(0).to(device)
+            past_mask = torch.zeros(1, past_boxes.shape[1], dtype=torch.bool, device=device)
+        elif args.autoregressive:
             valid = [t for t in tracks if t.is_valid(P, args.conf_thr, args.coher_thr)]
             if valid:
                 pb = np.stack([t.trajectory_recent_first(P) for t in valid], axis=0)
@@ -316,16 +295,31 @@ def main(args):
             pred_boxes = torch.zeros(0, 4, device=device)
         pred_future = outputs.future_boxes   # (1, N, T, 4) o None
 
-        # ── AR: aggiorna il tracker (per costruire il passato del frame dopo) ────
-        if args.autoregressive:
+        # AR con TrackTrack-AR
+        if args.autoregressive and tt is not None:
+            N = past_boxes.shape[1]
+            fut = pred_future[0, :N].detach().cpu().numpy() if pred_future is not None and N > 0 else None
+            dets, _ = tt.step(pred_boxes[:N].cpu().numpy(), scores[:N].cpu().numpy(),
+                              pred_boxes[N:].cpu().numpy(), scores[N:].cpu().numpy(), valid, fut)
+            tracks = tt.tracks
+            # forecast solo dei track ancora vivi
+            if pred_future is not None:
+                alive = {id(t) for t in tracks}
+                pred_future = pred_future[:, [k for k, t in enumerate(valid) if id(t) in alive]]
+            # detection disegnate = box emesse dal tracker in questo frame
+            pred_boxes = torch.tensor(np.array([d[0] for d in dets]), dtype=torch.float32).reshape(-1, 4)
+            scores = torch.tensor([float(d[1]) for d in dets], dtype=torch.float32)
+
+        # AR con il tracker legacy
+        elif args.autoregressive:
             N = past_boxes.shape[1]
             past_b, past_s = pred_boxes[:N].cpu().numpy(), scores[:N].cpu().numpy()
             std_b,  std_s  = pred_boxes[N:].cpu().numpy(), scores[N:].cpu().numpy()
+            # NMS sulle standard prima dell'associazione
+            std_b, std_s = nms_std(std_b, std_s, args.conf_thr, args.nms_threshold)
             updated, past_det_boxes = set(), []
             if args.std_box_priority:
-                # MERGE-FIX (standard over past): la box STANDARD (più fresca) aggiorna il track;
-                # il passato riempie i buchi e dà l'identità. Cambia il PASSATO ricostruito → in
-                # closed-loop si propaga ai frame successivi. Speculare al ramo dell'evaluator.
+                # la box standard aggiorna il track, il passato riempie i buchi
                 past_out = {t: (b, float(s)) for t, b, s in zip(valid, past_b, past_s)}
                 std_for_track = {}
                 for i in np.argsort(-std_s):                     # 1) standard prima: associa o spawn
@@ -336,7 +330,7 @@ def main(args):
                     if m is not None:
                         std_for_track[m] = (b, s); updated.add(m)
                     else:
-                        # anti-duplicato: se ricalca la box-passato di un track valido → è quel track
+                        # se coincide con la box-passato di un track valido, è quel track
                         hit = next((t for t in valid if t not in updated
                                     and past_out.get(t, (None, 0.0))[1] > args.conf_thr
                                     and box_iou_cxcywh(b, past_out[t][0]) >= args.std_past_iou_thr), None)
@@ -350,13 +344,10 @@ def main(args):
                     elif past_out.get(t, (None, 0.0))[1] > args.conf_thr:
                         b, s = past_out[t]; t.update(b, float(s)); updated.add(t)
             else:
-                # M4 (default, past over standard): il passato aggiorna i track; una detection
-                # standard che ricalca (IoU≥) una box-passato viene scartata.
+                # default: il passato aggiorna i track, le standard sovrapposte al passato sono scartate
                 for t, b, s in zip(valid, past_b, past_s):
                     if s > args.conf_thr:
                         t.update(b, float(s)); updated.add(t); past_det_boxes.append(b)
-                    else:
-                        t.missed += 1
                 for i in np.argsort(-std_s):
                     if std_s[i] <= args.conf_thr:
                         break
@@ -367,7 +358,18 @@ def main(args):
                     if m is not None:
                         m.update(b, s); updated.add(m)
                     else:
-                        tracks.append(Track(b, s, P))
+                        # il track appena nato conta come aggiornato
+                        nt = Track(b, s, P); tracks.append(nt); updated.add(nt)
+            # NMS fra track (resta il più vecchio), via anche il forecast del doppione
+            dup = duplicate_tracks(tracks, updated, args.nms_threshold)
+            if dup:
+                tracks = [t for t in tracks if t not in dup]
+                if pred_future is not None:
+                    pred_future = pred_future[:, [k for k, t in enumerate(valid) if t not in dup]]
+            # detection disegnate = box emesse dal tracker
+            emitted = [t for t in tracks if t in updated]
+            pred_boxes = torch.tensor(np.array([t.last for t in emitted]), dtype=torch.float32).reshape(-1, 4)
+            scores = torch.tensor([float(t.scores[-1]) for t in emitted], dtype=torch.float32)
             for t in tracks:
                 if t not in updated:
                     t.missed += 1
@@ -417,7 +419,7 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--index', default='/seidenas/datasets/FRED/preprocessed/test_windows_33ms.json')
-    # ── split diverso (es. challenging) senza ri-preprocessare ──
+    # split diverso (es. challenging)
     p.add_argument('--split_txt', default='',
                    help="gira su uno split diverso: .txt con le cartelle-sequenza del test (es. "
                         "challenging_test_split.txt). Fa pool(train+test) del preprocessed e filtra.")
@@ -434,13 +436,13 @@ if __name__ == '__main__':
     p.add_argument('--img_height', type=int, default=720)
     p.add_argument('--num_past_steps', type=int, default=12)
     p.add_argument('--use_custom_normalization', type=int, default=1)
-    # ── forecasting head ──
+    # forecasting head
     p.add_argument('--num_future_steps', type=int, default=24)
     p.add_argument('--forecast_head_type', default='transformer', choices=['transformer', 'mlp'])
     p.add_argument('--use_present_refine', type=int, default=1)
     p.add_argument('--use_cv_anchor', type=int, default=0)
     p.add_argument('--vel_avg_k', type=int, default=3)
-    # ── clip / scan ──
+    # clip / scan
     p.add_argument('--fps', type=int, default=30)
     p.add_argument('--max_frames', type=int, default=100000)
     p.add_argument('--start_frame', type=int, default=0)
@@ -450,7 +452,7 @@ if __name__ == '__main__':
     p.add_argument('--score_thr', type=float, default=0.3)
     p.add_argument('--crf', type=int, default=23)
     p.add_argument('--ffmpeg', default='ffmpeg')
-    # ── tracker AR ──
+    # tracker AR
     p.add_argument('--autoregressive', type=int, default=0)
     p.add_argument('--conf_thr', type=float, default=0.35)
     p.add_argument('--coher_thr', type=float, default=0.05)
@@ -461,5 +463,9 @@ if __name__ == '__main__':
                    help="1 = merge-fix (standard over past): la box standard fresca aggiorna il "
                         "track, il passato riempie i buchi. 0 = M4 (past over standard, default).")
     p.add_argument('--max_missed', type=int, default=6)
+    p.add_argument('--nms_threshold', type=float, default=0.45,
+                   help='IoU della NMS del tracker: standard doppie scartate + mai due track sullo '
+                        'stesso drone (resta il più vecchio)')
+    add_tracker_args(p)
     p.add_argument('--num_workers', type=int, default=4)
     main(p.parse_args())

@@ -27,7 +27,7 @@ def _seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 def _seed_worker(worker_id):
-    """Seed deterministico per ogni worker del DataLoader (augmentation riproducibile)."""
+    """Seed per ogni worker del DataLoader."""
     worker_seed = torch.initial_seed() % (2 ** 32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
@@ -51,20 +51,8 @@ def collide(traj, present_gt, thr=0.15):
     return iou.max().item() >= thr
 
 def augment_past_boxes(past_boxes, valid_mask, p, std, max_off):
-    """Perturbazione TEMPORALE-CORRELATA (random walk) delle past-box REALI, per simulare il
-    passato RUMOROSO che il modello genera da solo in autoregressive (exposure bias: in training
-    il passato è oracle, in AR è la sua stessa detrezione → mismatch che fa degradare l'AR).
-
-    past_boxes: (B, O, P, 4) cxcywh normalizzato — SOLO gli slot reali (PRIMA dei fake past).
-    valid_mask: (B, O) bool, True dove lo slot è un drone reale (non padding).
-    p:       prob. che un track valido venga perturbato (gli altri restano oracle).
-    std:     std del PASSO del random walk (frazione, unità normalizzate); 0 = no-op.
-             L'offset cumulato cresce ~ std·sqrt(P): correlato nel tempo, non i.i.d. per-frame.
-    max_off: clamp sull'offset cumulato (frazione) → niente box assurde (il "delta" necessario).
-
-    Perturba SOLO l'input: i target (present/future GT) non passano di qui. I fake past NON
-    sono toccati (sono un'altra augmentation). Train-only + gated: decide il chiamante.
-    """
+    """Random walk sulle past-box reali (B, O, P, 4) degli slot valid_mask, con prob. p per track.
+    std = passo del random walk, max_off = clamp dell'offset cumulato (frazioni della box)."""
     if std <= 0.0:
         return past_boxes
     B, O, P, _ = past_boxes.shape
@@ -72,35 +60,22 @@ def augment_past_boxes(past_boxes, valid_mask, p, std, max_off):
     sel = valid_mask & (torch.rand(B, O, device=dev) < p)              # (B,O) chi perturbare
     if not bool(sel.any()):
         return past_boxes
-    scale = torch.rand(B, O, 1, 1, device=dev) * std                   # magnitudine random per-track (curriculum)
+    scale = torch.rand(B, O, 1, 1, device=dev) * std                   # intensità per track
     offset = torch.cumsum(torch.randn(B, O, P, 4, device=dev) * scale, dim=2)  # random walk sull'asse temporale
     offset = offset.clamp(-max_off, max_off)
     p_cx, p_cy, p_w, p_h = past_boxes.unbind(-1)                       # (B,O,P) ciascuno
     ox, oy, ow, oh = offset.unbind(-1)
-    cx = (p_cx + ox * p_w).clamp(0.0, 1.0)                             # centro spostato ∝ dimensione box
+    cx = (p_cx + ox * p_w).clamp(0.0, 1.0)                             # offset proporzionale alla box
     cy = (p_cy + oy * p_h).clamp(0.0, 1.0)
-    w  = (p_w * (1.0 + ow)).clamp(1e-3, 1.0)                           # dimensione perturbata in modo moltiplicativo
+    w  = (p_w * (1.0 + ow)).clamp(1e-3, 1.0)                           # dimensioni moltiplicative
     h  = (p_h * (1.0 + oh)).clamp(1e-3, 1.0)
     aug = torch.stack([cx, cy, w, h], dim=-1)                          # (B,O,P,4)
     return torch.where(sel.unsqueeze(-1).unsqueeze(-1), aug, past_boxes)
 
 
 def realistic_past_noise(past_boxes, valid_mask, p, sigma, rho, max_off):
-    """Rumore REALISTICO sulle past-box: simula le box che il modello produce da solo in AR.
-    Calibrato sull'errore misurato su FRED reale (box del tracker vs GT, run AR del 2026-10-07):
-    centro ±13% della larghezza e ±10% dell'altezza, dimensioni ±22% / ±16%, autocorrelazione 0.87
-    fra frame consecutivi (la box sbaglia nello stesso modo per molti frame di fila).
-
-    Processo AR(1) STAZIONARIO sull'asse temporale: ogni box della finestra ha lo stesso errore tipico,
-    compresa la più recente (indice 0, che è il punto di riferimento della query), e l'errore cambia
-    lentamente da un frame all'altro. La random walk di augment_past_boxes invece parte da ~0 proprio
-    sulla box più recente.
-
-    past_boxes: (B, O, P, 4) cxcywh normalizzato; valid_mask: (B, O) True = slot da perturbare.
-    p: prob. per track; sigma: (sx, sy, sw, sh) std in frazioni della box; rho: autocorrelazione lag-1;
-    max_off: clamp dell'errore (frazione della box). Ogni track ha un'intensità propria in [0.5, 1.5]·sigma.
-    Perturba solo l'INPUT: i target non passano di qui. Train-only + gated: decide il chiamante.
-    """
+    """Rumore AR(1) stazionario sulle past-box reali (B, O, P, 4): sigma = (sx, sy, sw, sh) in frazioni
+    della box, rho = autocorrelazione fra frame, calibrati sull'errore del tracker su FRED."""
     if p <= 0 or past_boxes.numel() == 0:
         return past_boxes
     B, O, P, _ = past_boxes.shape
@@ -114,11 +89,11 @@ def realistic_past_noise(past_boxes, valid_mask, p, sigma, rho, max_off):
     for k in range(1, P):
         e.append(rho * e[-1] + c * n[:, :, k])                          # Var(e_k) = 1 per ogni k
     scale = torch.tensor(sigma, device=dev, dtype=dt).view(1, 1, 1, 4) \
-        * (0.5 + torch.rand(B, O, 1, 1, device=dev, dtype=dt))          # intensità per track in [0.5, 1.5]·sigma
+        * (0.5 + torch.rand(B, O, 1, 1, device=dev, dtype=dt))          # intensità per track
     e = (torch.stack(e, dim=2) * scale).clamp(-max_off, max_off)        # (B,O,P,4): ex, ey, ew, eh
     p_cx, p_cy, p_w, p_h = past_boxes.unbind(-1)
     ex, ey, ew, eh = e.unbind(-1)
-    noisy = torch.stack([(p_cx + ex * p_w).clamp(0.0, 1.0),             # centro spostato ∝ dimensione box
+    noisy = torch.stack([(p_cx + ex * p_w).clamp(0.0, 1.0),             # offset proporzionale alla box
                          (p_cy + ey * p_h).clamp(0.0, 1.0),
                          (p_w * (1.0 + ew)).clamp(1e-3, 1.0),           # dimensione moltiplicativa
                          (p_h * (1.0 + eh)).clamp(1e-3, 1.0)], dim=-1)
@@ -126,23 +101,9 @@ def realistic_past_noise(past_boxes, valid_mask, p, sigma, rho, max_off):
 
 
 def vanishing_pasts(target, num_past, max_gap, future_check=True, border=0.0):
-    """Finestre di passato di droni che SPARISCONO: presenti nei frame precedenti, assenti ora.
-    È ciò che il tracker AR manda al modello quando un drone esce dall'inquadratura: il track resta
-    query-passato per qualche frame, con le box mancanti completate dalla previsione. In training finora
-    ogni query-passato reale aveva un drone sotto (valid_ids = presenti ∩ passati), quindi il modello
-    impara "query-passato ⇒ drone presente" e in AR conferma i fantasmi.
-
-    Ritorna le finestre (P, 4), indice 0 = più recente, dei droni assenti ora, presenti senza buchi
-    negli step m..P-1 e assenti nei m più recenti, con 0 ≤ m ≤ max_gap (m = 0: escono proprio ora).
-    Le m box mancanti sono estrapolate a velocità costante dalle ultime due osservate, come fa il tracker.
-
-    future_check: scarta i droni che RICOMPAIONO nelle annotazioni future del campione (future_ids):
-      non sono usciti davvero, è un buco di annotazione o un'occlusione. Su FRED reale (seq 46, frame
-      684) il drone resta ben visibile negli eventi per 3 frame mentre la GT manca per 6: come negativo
-      insegnerebbe al modello a ignorare un drone vero.
-    border: se > 0, tiene solo i droni la cui ultima box osservata è entro questa distanza (normalizzata)
-      dal bordo dell'immagine, cioè le uscite dall'inquadratura. 0 = nessun vincolo.
-    """
+    """Finestre (P, 4) dei droni presenti nel passato ma assenti ora, spariti da m <= max_gap frame
+    (box mancanti a velocità costante). future_check scarta quelli che ricompaiono nel futuro,
+    border > 0 tiene solo le uscite dal bordo."""
     past_ids = target.get('past_ids', [])
     past_boxes = target.get('past_boxes', [])
     if num_past < 2 or len(past_ids) < num_past:
@@ -158,7 +119,7 @@ def vanishing_pasts(target, num_past, max_gap, future_check=True, border=0.0):
     for vid in sorted(set().union(*(s.keys() for s in per_step)) - present - future):
         here = [vid in s for s in per_step]                       # indice 0 = step più recente
         m = here.index(True)                                       # frame di assenza prima di adesso
-        if m > max_gap or m > num_past - 2 or not all(here[m:]):  # senza buchi da m in poi, ≥ 2 box vere
+        if m > max_gap or m > num_past - 2 or not all(here[m:]):  # senza buchi da m in poi, almeno 2 box
             continue
         if border > 0:                                             # solo uscite dall'inquadratura
             cx, cy, w, h = per_step[m][vid].tolist()
@@ -167,7 +128,7 @@ def vanishing_pasts(target, num_past, max_gap, future_check=True, border=0.0):
         win = torch.zeros(num_past, 4)
         for k in range(m, num_past):
             win[k] = per_step[k][vid]
-        if m > 0:                                                  # buco recente → previsione a velocità costante
+        if m > 0:                                                  # box mancanti a velocità costante
             v = win[m, :2] - win[m + 1, :2]                        # spostamento per frame, verso il presente
             for k in range(m - 1, -1, -1):
                 win[k] = win[k + 1]
@@ -183,7 +144,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
 
     phase = getattr(config, "phase", 1)
 
-    # --- Query-mode misto (solo train, solo phase 2): randomizza la modalità per batch ---
+    # --- Query mode misto (solo train, phase 2) ---
     mode = 'both'
     if augment and phase == 2 and getattr(config, "use_mixed_query_mode", 0):
         r = random.random()
@@ -204,32 +165,30 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
     fake_p           = getattr(config, "fake_past_p", 0.3)
     fake_max_k       = getattr(config, "fake_max_k", 3)
     fake_collide_thr = getattr(config, "fake_collide_thr", 0.15)
-    # Passato di un drone che SPARISCE (vedi vanishing_pasts): negativi reali, come i fake → sfondo
+    # droni che spariscono (vanishing_pasts)
     use_vanish       = bool(augment and phase == 2 and is_both and getattr(config, "use_vanish_past", 0))
     vanish_p         = getattr(config, "vanish_past_p", 1.0)
     vanish_max_gap   = int(getattr(config, "vanish_max_gap", 6))
     vanish_keep_empty = bool(getattr(config, "vanish_keep_empty", 1))
     vanish_future_check = bool(getattr(config, "vanish_future_check", 1))
     vanish_border    = float(getattr(config, "vanish_border", 0.0))
-    # Rumore REALISTICO sul passato (vedi realistic_past_noise)
+    # rumore sul passato (realistic_past_noise)
     use_noise        = bool(augment and phase == 2 and getattr(config, "use_past_noise", 0))
     noise_args       = (getattr(config, "past_noise_p", 0.5),
                         (getattr(config, "past_noise_sx", 0.13), getattr(config, "past_noise_sy", 0.10),
                          getattr(config, "past_noise_sw", 0.22), getattr(config, "past_noise_sh", 0.16)),
                         getattr(config, "past_noise_rho", 0.87), getattr(config, "past_noise_max", 0.6))
-    # Passato CLOSED-LOOP prodotto dal modello (training curriculum, train/closed_loop_cache.py): con
-    # probabilità p un frame usa le finestre del tracker (rollout del modello) al posto del passato GT.
-    # self_past = {'cache': {frame_key: (finestre (N,P,4), target_id (N,))}, 'p': float} dal trainer.
-    # I TARGET restano GT: finestra abbinata → box/futuro del drone; target_id -1 → sfondo (come i fake).
+    # passato closed-loop: con prob. p un frame usa le finestre del rollout invece del passato GT
+    # self_past = {'cache': {frame_key: (finestre (N,P,4), target_id (N,))}, 'p': float}
     self_cache = self_past.get('cache') if self_past else None
     self_p     = float(self_past.get('p', 0.0)) if self_past else 0.0
     use_self   = bool(augment and phase == 2 and is_both and getattr(config, "use_self_past", 0)
                       and self_cache and self_p > 0)
 
     valid_batch = []  # per i droni con passato
-    vanish_by_sample = []  # parallela a valid_batch: finestre di droni che spariscono (con use_vanish)
-    self_by_sample = []    # parallela a valid_batch: {id GT: finestra closed-loop} (None = passato GT)
-    selfneg_by_sample = [] # parallela a valid_batch: finestre closed-loop senza drone (→ sfondo)
+    vanish_by_sample = []  # finestre vanish per sample
+    self_by_sample = []    # {id GT: finestra closed-loop} per sample (None = passato GT)
+    selfneg_by_sample = [] # finestre closed-loop senza drone per sample
     n_self_frames = 0
     skipped = 0
 
@@ -242,7 +201,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
         present_ids = target.get('ids', torch.zeros(0, dtype=torch.int64)) # id dei droni presenti ora
         past_ids_list = target.get('past_ids', []) # lista di 10 tensori (10 passati) ognuno con gli id dei droni in quel passato
 
-        # frame in modalità closed-loop? (finestre del rollout del modello al posto del passato GT)
+        # frame con passato closed-loop?
         self_entry = None
         if use_self and random.random() < self_p:
             self_entry = self_cache.get(target.get('frame_key'))
@@ -254,9 +213,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
                       if random.random() < vanish_p]
 
         if len(present_ids) == 0: # nessun drone nella scena
-            # con use_vanish il frame resta: è proprio qui che un drone appena uscito lascia una
-            # query-passato senza drone sotto (e con vanish_keep_empty restano anche i frame vuoti normali).
-            # In closed-loop resta se il tracker ha finestre qui (fantasmi veri → negativi).
+            # resta se ha finestre closed-loop o vanish (o con vanish_keep_empty)
             self_has_windows = self_entry is not None and len(self_entry[0]) > 0
             if not (self_has_windows or (use_vanish and (vanish or vanish_keep_empty))):
                 skipped += 1
@@ -268,9 +225,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
 
         self_map, self_negs = None, []
         if self_entry is not None:
-            # CLOSED-LOOP: query = finestre del tracker. Abbinate (target_id >= 0) → slot reali con la
-            # GT di quel drone; non abbinate → negativi (sfondo). Niente dropout: i droni senza
-            # finestra sono già quelli che il tracker non segue → vanno alle query standard.
+            # finestre abbinate -> slot reali con la GT del drone, non abbinate -> negativi
             wins, tids = self_entry
             present_set = set(present_ids.tolist())
             self_map = {int(t): wins[i] for i, t in enumerate(tids) if t >= 0 and int(t) in present_set}
@@ -391,9 +346,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             for p_idx in range(num_past):
                 past_boxes[b, drone_idx, p_idx] = id_to_past[vid][p_idx]
 
-    # --- Augmentation past-oracle (anti exposure-bias AR): random walk sulle past-box REALI ---
-    # Solo train, phase 2, gated. Perturba l'INPUT passato (i target restano oracle); i fake past,
-    # aggiunti dopo, NON sono toccati. ~past_mask = slot reali (non padding).
+    # random walk sulle past-box reali (solo train, phase 2)
     if augment and phase == 2 and getattr(config, 'use_past_aug', 0):
         past_boxes = augment_past_boxes(
             past_boxes, ~past_mask & ~self_slot,
@@ -401,11 +354,11 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             getattr(config, 'past_aug_std', 0.05),
             getattr(config, 'past_aug_max', 0.2),
         )
-    # Rumore REALISTICO (AR(1) stazionario, calibrato sull'errore AR misurato): stesso punto, stessi slot
+    # rumore AR(1), stessi slot
     if use_noise:
         past_boxes = realistic_past_noise(past_boxes, ~past_mask & ~self_slot, *noise_args)
 
-    # Build future_gt (B, max_objects, T, 4) + future_mask (B, max_objects, T) — forecasting, solo query-passato
+    # future_gt (B, max_objects, T, 4) e future_mask (B, max_objects, T), solo query-passato
     num_future = getattr(config, "num_future_steps", 0)
     future_gt = None
     future_mask = None
@@ -454,12 +407,10 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
                     scelte.append(traj)
             fake_per_sample.append(scelte)
     else:
-        # nessun finto: max_fake=0, i cat sottostanti sono no-op, fake_mask tutto False
+        # nessun finto: fake_mask tutto False
         fake_per_sample = [[] for _ in range(batch_size)]
 
-    # Passato di un drone che SPARISCE: le sue finestre si aggiungono ai fake come negativi (sfondo).
-    # Scartate se la box più recente ricalca un drone presente (sarebbe ambiguo: la query potrebbe
-    # legittimamente ritrovare l'altro drone).
+    # vanish: negativi aggiunti ai fake (scartati se sovrapposti a un drone presente)
     n_fake_only = [len(s) for s in fake_per_sample]
     if use_vanish:
         for sample in range(batch_size):
@@ -467,8 +418,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             fake_per_sample[sample] = list(fake_per_sample[sample]) + [
                 w for w in vanish_by_sample[sample] if not collide(w, present_gt, thr=fake_collide_thr)]
 
-    # Finestre CLOSED-LOOP senza drone (fantasmi, track sul clutter, doppioni): negativi veri, come i
-    # fake → sfondo. Stesso filtro anti-ambiguità dei vanish; niente rumore (sono già box del modello).
+    # finestre closed-loop senza drone: negativi come i fake, stesso filtro
     n_before_self = [len(s) for s in fake_per_sample]
     n_selfneg = 0
     for sample in range(batch_size):
@@ -489,7 +439,7 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
             fake_valid[b, j] = True
             vanish_valid[b, j] = n_fake_only[b] <= j < n_before_self[b]
     if use_noise and bool(vanish_valid.any()):
-        # in AR anche la finestra di un drone che sparisce è fatta di box del modello: stesso rumore
+        # rumore anche sulle finestre vanish
         fake_boxes = realistic_past_noise(fake_boxes, vanish_valid, *noise_args)
 
     ## Esempio:
@@ -563,30 +513,28 @@ def collate_fn_detection_rtdetrv2_past_conditioned(batch, image_processor, confi
         'past_boxes': past_boxes,
         'past_mask': past_mask, # maschera per il padding di droni che non esistono nel frame (past_boxes e grande max_objects)
         'new_labels': new_labels, # droni senza passato
-        'fake_mask': fake_mask, # TEST FAKE PAST (include i negativi dei droni che spariscono)
-        'n_vanish': int(vanish_valid.sum()), # n. negativi "drone che sparisce" nel batch (logging)
-        'n_self_frames': n_self_frames,      # n. frame del batch con passato closed-loop (logging)
-        'n_selfneg': n_selfneg,              # n. negativi closed-loop (fantasmi veri) nel batch (logging)
+        'fake_mask': fake_mask, # TEST FAKE PAST
+        'n_vanish': int(vanish_valid.sum()), # per il logging
+        'n_self_frames': n_self_frames,      # per il logging
+        'n_selfneg': n_selfneg,              # per il logging
         'query_mode': mode, # modalità campionata (mixed-mode training)
-        'future_gt': future_gt, # (B, max_objects, T, 4) — forecasting (None se num_future_steps=0)
-        'future_mask': future_mask, # (B, max_objects, T) — True dove il drone esiste nel futuro
+        'future_gt': future_gt, # (B, max_objects, T, 4) o None
+        'future_mask': future_mask, # (B, max_objects, T)
     }
 
 class PastConditionedTrainer(BaseTrainer):
     def __init__(self, config):
         _seed_everything(getattr(config, 'seed', 42))
         super().__init__(config)
-        self.global_step = 0   # contatore monotòno globale (asse x di wandb)
-        # early-stopping: inizializzati qui così esistono anche se la 1a val NON migliora
-        # (es. in resume con best_val_loss già finito) → niente AttributeError.
+        self.global_step = 0   # step globale per wandb
+        # early stopping
         self.patience = getattr(config, 'patience', 5)
         self.patience_counter = getattr(self, 'patience_counter', 0)
-        # training curriculum con passato closed-loop (use_self_past): stato della rampa di p
+        # stato del curriculum closed-loop
         self.self_past_state = {'r': 0.0, 'q_val': None, 'q_train': None, 'p': 0.0}
 
     def _set_model_mode(self):
-        """eval() se il detector è congelato (le statistiche BatchNorm non driftano),
-        altrimenti train(). Da usare al posto di self.model.train() durante il training."""
+        """eval() se il detector è congelato (BatchNorm fisse), altrimenti train()."""
         if getattr(self.config, 'freeze_detector', 0):
             self.model.eval()
         else:
@@ -603,9 +551,7 @@ class PastConditionedTrainer(BaseTrainer):
         print(f" Using index file: {self.config.index_path}")
         print(f" Task modality: {task_modality}")
 
-        # train: augmentation ON (gestita dai flag di config); val: augmentation OFF (passato pulito)
-        # _self_past: cache del passato closed-loop + p (training curriculum), aggiornata a inizio epoca
-        # da _refresh_self_past; i worker la ricevono quando vengono creati (per questo non persistenti).
+        # train con augmentation, val senza; _self_past aggiornato a inizio epoca da _refresh_self_past
         self._self_past = {'cache': None, 'p': 0.0}
         self.train_collate = lambda batch: collate_fn_detection_rtdetrv2_past_conditioned(
             batch, image_processor=self.image_processor, config=self.config, augment=True,
@@ -623,7 +569,7 @@ class PastConditionedTrainer(BaseTrainer):
         )
         self.val_dataset = get_dataset(
             self.config.dataset_name,
-            split='val',   # val = SEQUENZE held-out del train (seq_split) → niente leak "val=test"
+            split='val',   # sequenze tenute fuori dal train (seq_split)
             modality=task_modality,
             config=self.config
         )
@@ -647,8 +593,7 @@ class PastConditionedTrainer(BaseTrainer):
             worker_init_fn=_seed_worker,
         )
 
-        # Validation: POCHI worker e NON persistenti → si liberano subito dopo la val.
-        # Evita l'overlap "8 train persistenti + N val" che saturava la RAM (SIGKILL in validation).
+        # val: pochi worker non persistenti (RAM)
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=self.config.val_batch_size,
@@ -686,8 +631,7 @@ class PastConditionedTrainer(BaseTrainer):
 
         self.model = get_model(model_name, self.device, self.config)
 
-        # --- Opzionale: carica un detector pretrained (es. il tuo 84% map). ---
-        # Indipendente dal freeze: path SENZA freeze = fine-tuning; path CON freeze = frozen.
+        # detector pretrained opzionale (fine-tuning, o frozen con freeze_detector)
         ckpt_path = getattr(self.config, 'pretrained_detector_path', '')
         if ckpt_path:
             print(f"[pretrained] Carico detector: {ckpt_path}")
@@ -696,7 +640,7 @@ class PastConditionedTrainer(BaseTrainer):
             missing, unexpected = self.model.load_state_dict(state, strict=False)
             print(f"[pretrained] missing: {len(missing)} | unexpected: {len(unexpected)}")
 
-        # --- Opzionale: congela tutto tranne UN modulo (default past_encoder; forecasting → forecasting_head) ---
+        # freeze opzionale: allena solo il modulo trainable_when_frozen
         if getattr(self.config, 'freeze_detector', 0):
             keep = getattr(self.config, 'trainable_when_frozen', 'past_encoder')
             for name, param in self.model.named_parameters():
@@ -805,7 +749,7 @@ class PastConditionedTrainer(BaseTrainer):
         epoch_loss_bbox = 0.0
         epoch_loss_giou = 0.0
 
-        # ── Benchmark throughput (attivo solo se --bench_batches > 0) ──
+        # benchmark del throughput (--bench_batches > 0)
         import time as _time
         bench_n = int(getattr(self.config, 'bench_batches', 0) or 0)
         bench_warmup = int(getattr(self.config, 'bench_warmup', 10) or 0)
@@ -854,29 +798,23 @@ class PastConditionedTrainer(BaseTrainer):
 
             phase = getattr(self.config, 'phase', 1)
             B = len(detr_labels)
-            N = past_boxes.shape[1]   # n. query-passato (reali + fake); usato solo quando il past gira
+            N = past_boxes.shape[1]   # query-passato (reali + fake)
             device = self.device
             new_labels = batch.get('new_labels', None)
             fake_mask = batch.get('fake_mask', None)
             if fake_mask is not None:
                 fake_mask = fake_mask.to(device)
 
-            # ── Loss UFFICIALE RT-DETR sul ramo STANDARD (encoder-loss + deep supervision + VFL) ──
-            # Ripristina ciò che il port past-conditioned aveva rimosso: senza la loss dell'encoder
-            # enc_score_head non riceve gradiente e le query standard non trovano i droni.
-            # Gira in standard_only (tutte le query standard) E in both (solo le slot [N:]);
-            # il ramo passato resta sulla loss manuale sotto. GT standard = TUTTI i droni (con +
-            # senza passato) → in both le box passato/standard si sovrappongono e la dedup avviene
-            # a inference (M4, priorità al passato). enc_topk sono già le 50 proposte → nessuno slice.
+            # loss RT-DETR del ramo standard (encoder + deep supervision + VFL), GT = tutti i droni
             loss_std_rtdetr = None
-            _std_ldict = None          # breakdown loss RT-DETR (per il logging wandb)
+            _std_ldict = None          # per il logging
             if phase == 2 and mode in ('standard_only', 'both'):
                 N_std = N if mode == 'both' else 0     # in both le query standard sono le slot [N:]
                 branch = self.model.primary_branch
                 std_labels = []
                 for b in range(B):
                     _nb = new_labels[b]['boxes'].to(device) if new_labels is not None else torch.zeros(0, 4, device=device)
-                    _boxes = torch.cat([detr_labels[b]['boxes'], _nb], dim=0)   # TUTTI i droni (con + senza passato)
+                    _boxes = torch.cat([detr_labels[b]['boxes'], _nb], dim=0)   # tutti i droni
                     std_labels.append({
                         'class_labels': torch.zeros(_boxes.shape[0], dtype=torch.int64, device=device),
                         'boxes': _boxes,
@@ -892,10 +830,7 @@ class PastConditionedTrainer(BaseTrainer):
 
             box_pred_list, box_gt_list = [], []
             cls_logits_list, cls_targets_list = [], []
-            # Proposta C: present-refinement dalla forecasting head (None se non attiva).
-            # Con use_present_refine=0 il modello ritorna present_refined = pred_boxes (grezze):
-            # NON va supervisionato (duplicherebbe la box loss) → lo trattiamo come assente
-            # così la refine-loss non viene né calcolata né sommata.
+            # present refinement solo con use_present_refine
             present_refined = outputs.present_refined if getattr(self.config, 'use_present_refine', 1) else None
             refined_pred_list, refined_gt_list = [], []
             num_pos = 0
@@ -927,7 +862,7 @@ class PastConditionedTrainer(BaseTrainer):
             for b in range(B):
                 n = detr_labels[b]['boxes'].shape[0]   # droni con passato (present_labels)
 
-                # --- ramo PASSATO (both, past_only; in phase 1 il modello fa comunque past-only) ---
+                # --- ramo passato ---
                 if mode in ('both', 'past_only') and n > 0:
                     box_pred_list.append(pred_boxes[b, :n])
                     box_gt_list.append(detr_labels[b]['boxes'])
@@ -935,7 +870,7 @@ class PastConditionedTrainer(BaseTrainer):
                     if phase == 2:
                         cls_logits_list.append(logits[b, :n])
                         cls_targets_list.append(torch.ones_like(logits[b, :n]))   # foreground
-                    # Proposta C: present-refinement supervisionato sulla STESSA present-GT
+                    # present refinement sulla stessa GT
                     if present_refined is not None:
                         refined_pred_list.append(present_refined[b, :n])
                         refined_gt_list.append(detr_labels[b]['boxes'])
@@ -950,13 +885,10 @@ class PastConditionedTrainer(BaseTrainer):
                         fake_score_sum += fake_logits.sigmoid().sum().item()
                         fake_score_cnt += fake_logits.numel()
 
-                # --- ramo STANDARD: gestito sopra da branch.loss_function (loss_std_rtdetr) ---
-                # Sia in both sia in standard_only il ramo standard usa ora la loss UFFICIALE
-                # RT-DETR (encoder + deep supervision + VFL). NON si matcha più a mano: era il
-                # match manuale (solo new_labels, senza encoder-loss) che faceva collassare lo standard.
+                # ramo standard: loss_std_rtdetr sopra
 
             if len(box_pred_list) == 0 and len(cls_logits_list) == 0 and loss_std_rtdetr is None:
-                continue  # niente box/logits manuali E niente loss standard RT-DETR → skippo
+                continue  # niente da ottimizzare
 
             loss_bbox = torch.zeros((), device=device)
             loss_giou = torch.zeros((), device=device)
@@ -965,12 +897,12 @@ class PastConditionedTrainer(BaseTrainer):
                 pred_flat = torch.cat(box_pred_list, dim=0) # tot_box, 4
                 gt_flat = torch.cat(box_gt_list, dim=0) # tot_box, 4, in questo modo pred_flat[i] e gt_flat[i] sono allineati
                 loss_bbox = F.l1_loss(pred_flat, gt_flat, reduction='sum') / max(num_pos, 1) # loss di regressione sulle coordinate
-                # RIFERIMENTO (approccio precedente O(N²): matrice piena per la sola diagonale)
+                # versione precedente:
                 # giou_diag = generalized_box_iou(
                 #     center_to_corners_format(pred_flat),
                 #     center_to_corners_format(gt_flat),
                 # ).diag() # dalla matrice predizioni/gt prendo la diagonale ovvero le iou(pred_i, gt_i)
-                giou_diag = paired_generalized_box_iou(          # O(N): GIoU appaiato pred_i↔gt_i
+                giou_diag = paired_generalized_box_iou(          # GIoU(pred_i, gt_i)
                     center_to_corners_format(pred_flat),
                     center_to_corners_format(gt_flat),
                 )
@@ -983,7 +915,7 @@ class PastConditionedTrainer(BaseTrainer):
                 cls_targets = torch.cat(cls_targets_list, dim=0)
                 loss_cls = sigmoid_focal_loss(cls_logits, cls_targets, num_pos)
 
-            # ── Present-refinement (Proposta C): L1+GIoU present_refined↔present-GT ──
+            # present refinement: L1 + GIoU
             loss_present_refine = torch.zeros((), device=device)
             if len(refined_pred_list) > 0:
                 rp = torch.cat(refined_pred_list, dim=0)
@@ -997,7 +929,7 @@ class PastConditionedTrainer(BaseTrainer):
                 loss_ref_giou = (1 - giou_ref).sum() / num_ref
                 loss_present_refine = loss_ref_l1 * 5.0 + loss_ref_giou * 2.0
 
-            # ── Forecasting (passo 3): L1+GIoU su (query-passato, step) validi ──
+            # forecasting: L1 + GIoU sulle coppie (query-passato, step) valide
             loss_forecast = torch.zeros((), device=device)
             future_gt = batch.get('future_gt', None)
             future_boxes = outputs.future_boxes                      # (B, Q, T, 4) o None
@@ -1005,35 +937,30 @@ class PastConditionedTrainer(BaseTrainer):
                 future_gt = future_gt.to(device)                     # (B, M, T, 4)
                 future_mask = batch['future_mask'].to(device)        # (B, M, T) bool
                 M = future_gt.shape[1]                               # max_objects (past reali)
-                fp = future_boxes[:, :M]                             # (B, M, T, 4) — query-passato reali
+                fp = future_boxes[:, :M]                             # (B, M, T, 4), query-passato reali
                 if future_mask.any():
                     pred_sel = fp[future_mask]                       # (K, 4)
                     gt_sel   = future_gt[future_mask]                # (K, 4)
-                    # Weighting progressivo per-step: i passi lontani (spostamento maggiore)
-                    # pesano di più → contrastano l'attrattore "stay put" del forecasting.
-                    # w_t = 1 + ((t+1)/T)·(w_max−1): ramp da ~1 (t=0) a w_max (t=T−1). w_max=1 ⇒ media uniforme.
+                    # peso crescente con lo step: w_t = 1 + ((t+1)/T) * (w_max - 1)
                     T_fut = fp.shape[2]
                     w_max = float(getattr(self.config, 'forecast_step_weight_max', 3.0))
                     step_w = 1.0 + (torch.arange(1, T_fut + 1, device=device, dtype=fp.dtype) / T_fut) * (w_max - 1.0)
                     w = step_w.view(1, 1, T_fut).expand(fp.shape[0], M, T_fut)[future_mask]   # (K,) peso per coppia
                     w_sum = w.sum().clamp(min=1e-6)
-                    # (rif. O(N²) precedente: generalized_box_iou(...).diag(), sostituito da paired_giou)
                     l1_per   = F.l1_loss(pred_sel, gt_sel, reduction='none').sum(dim=-1)       # (K,) L1 per box
                     giou_per = 1.0 - paired_generalized_box_iou(
                         center_to_corners_format(pred_sel),
                         center_to_corners_format(gt_sel),
                     )                                                                          # (K,)
-                    loss_fut_l1   = (l1_per * w).sum() / w_sum       # media PESATA (w_max=1 ⇒ media semplice)
+                    loss_fut_l1   = (l1_per * w).sum() / w_sum       # media pesata
                     loss_fut_giou = (giou_per * w).sum() / w_sum
                     loss_forecast = loss_fut_l1 * 5.0 + loss_fut_giou * 2.0
 
             fw = getattr(self.config, 'forecast_loss_weight', 1.0)
-            rw = getattr(self.config, 'present_refine_loss_weight', 1.0)   # peso del present-refinement (Proposta C)
+            rw = getattr(self.config, 'present_refine_loss_weight', 1.0)
             loss = (loss_bbox * 5.0 + loss_giou * 2.0 + loss_cls * 1.0
                     + loss_forecast * fw + loss_present_refine * rw)
-            # Ramo standard (loss ufficiale RT-DETR, già pesata internamente con main+aux+enc).
-            # In both convive con la loss del ramo passato: std_loss_weight bilancia i due
-            # (default 1.0; in joint può servire <1 se il ramo passato/forecasting sotto-allena).
+            # ramo standard, pesato con std_loss_weight
             if loss_std_rtdetr is not None:
                 sw = getattr(self.config, 'std_loss_weight', 1.0)
                 loss = loss + loss_std_rtdetr * sw
@@ -1056,8 +983,7 @@ class PastConditionedTrainer(BaseTrainer):
                     future_mask=batch.get('future_mask', None),
                 )
         
-            # Backward pass (salta se la loss non ha gradiente:
-            # es. forecasting con detector frozen e batch senza coppie future valide)
+            # backward (salta se la loss non ha gradiente)
             self.optimizer.zero_grad()
             if loss.requires_grad:
                 loss.backward()
@@ -1065,8 +991,7 @@ class PastConditionedTrainer(BaseTrainer):
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-            # 3.D — ogni .item() forza una sync CUDA: calcolo ciascuno scalare UNA volta e
-            # riuso il float per accumulo/wandb/pbar (prima loss.item() girava ~3×/batch).
+            # un solo .item() per scalare
             loss_val          = loss.item()
             loss_bbox_val     = loss_bbox.item()
             loss_giou_val     = loss_giou.item()
@@ -1091,8 +1016,7 @@ class PastConditionedTrainer(BaseTrainer):
                     "train/loss_present_refine": loss_refine_val,
                     "train/learning_rate": self.optimizer.param_groups[0]['lr'],
                 }
-                # standard_only: breakdown della loss ufficiale RT-DETR (vfl/bbox/giou + copie enc/aux).
-                # Impilo i valori e faccio UN solo .tolist() → un solo sync CUDA (non uno per chiave).
+                # componenti della loss RT-DETR del ramo standard
                 if _std_ldict is not None and len(_std_ldict) > 0:
                     _sk = list(_std_ldict.keys())
                     _sv = torch.stack([
@@ -1107,7 +1031,7 @@ class PastConditionedTrainer(BaseTrainer):
             pbar.set_postfix({'loss': f"{loss_val:.4f}", 'fcast': f"{loss_forecast_val:.3f}",
                               'refine': f"{loss_refine_val:.3f}"})
 
-            # ── Benchmark: chiudo la misura di questa iterazione ed eventualmente esco ──
+            # benchmark
             if bench_n > 0:
                 if _cuda:
                     torch.cuda.synchronize()
@@ -1130,7 +1054,7 @@ class PastConditionedTrainer(BaseTrainer):
                         f"gpu_alloc_MB={peak_a:.0f} gpu_resv_MB={peak_r:.0f}",
                         flush=True,
                     )
-                    os._exit(0)   # uscita bulletproof: il benchmark è finito
+                    os._exit(0)   # fine benchmark
 
         num_batches = len(self.train_loader)
         return {
@@ -1140,15 +1064,11 @@ class PastConditionedTrainer(BaseTrainer):
         }
     
 
-    # ── Training curriculum: passato CLOSED-LOOP prodotto dal modello (train/closed_loop_cache.py) ──
+    # --- curriculum con passato closed-loop (train/closed_loop_cache.py) ---
     def _self_past_init(self):
-        """Una volta sola: sequenze train/val (le stesse dello split del training) e chiavi dei frame di
-        training. Niente secondo dataset completo sull'index (617k finestre: GB di RAM per tutto il
-        training, pagine duplicate dai worker riforkati a ogni epoca → OOM): le finestre consecutive del
-        rollout le ricava _sp_rollout_dataset, solo per le sequenze scelte, dalla tabella del passato
-        che il dataset di training ha già in memoria."""
+        """Sequenze train/val del rollout e chiavi dei frame di training."""
         from data.datasets.event_dataset_forecasting import frame_key
-        lookup = self.train_dataset._windows_by_file    # TUTTE le finestre dell'index (prima di subsample e split)
+        lookup = self.train_dataset._windows_by_file    # tutte le finestre, prima di subsample e split
         train_paths = {w['hdf5_path'] for w in self.train_dataset.windows}
         val_paths = {w['hdf5_path'] for w in self.val_dataset.windows}
         self._sp_train = sorted(p for p in lookup if p in train_paths)
@@ -1159,10 +1079,8 @@ class PastConditionedTrainer(BaseTrainer):
               f"({len(self._sp_val)} sequenze) | frame di training da salvare {len(self._sp_keep)}")
 
     def _sp_rollout_dataset(self, paths):
-        """Dataset del rollout per le sole sequenze `paths`, con frame CONSECUTIVI (subsample=1): le
-        finestre dell'index (stesse annotazioni) prese da train_dataset._windows_by_file, senza futuro.
-        Copia leggera del dataset di training (renderer e tabella del passato condivisi), da buttare
-        dopo il rollout. Ritorna (dataset, {hdf5_path: [indici in ordine temporale]})."""
+        """Copia leggera del dataset di training con i frame consecutivi delle sequenze `paths`.
+        Ritorna (dataset, {hdf5_path: indici in ordine temporale})."""
         import copy
         lookup = self.train_dataset._windows_by_file
         ds = copy.copy(self.train_dataset)
@@ -1176,12 +1094,7 @@ class PastConditionedTrainer(BaseTrainer):
         return ds, seqs
 
     def _refresh_self_past(self, epoch):
-        """A inizio epoca: (1) ogni self_past_refresh epoche dopo il warm-up, rollout closed-loop del
-        modello corrente su una frazione delle sequenze di training (→ cache) e di val (→ q e mAP50 del
-        closed loop); (2) p dell'epoca secondo self_past_schedule (train/closed_loop_cache.py::schedule_p):
-          ramp:        r += self_past_step se q ≥ self_past_q_min; p = min(self_past_p_max, r)
-          product_iou: p = min(self_past_p_max, max(q, self_past_floor) · epoca/epoche)
-          product_map: p = min(self_past_p_max, max(mAP50, self_past_floor) · epoca/epoche)"""
+        """Rollout closed-loop su train (cache) e val (q, mAP50), poi p dell'epoca con schedule_p."""
         import gc as _gc
         import random as _random
         from train.closed_loop_cache import rollout_closed_loop, schedule_p, SCHEDULES
@@ -1204,7 +1117,8 @@ class PastConditionedTrainer(BaseTrainer):
             rng = _random.Random(int(getattr(cfg, 'seed', 42)) * 1000 + epoch)
             kw = dict(match_iou=float(getattr(cfg, 'self_past_match_iou', 0.1)),
                       max_frames=int(getattr(cfg, 'self_past_max_frames', 0)),
-                      num_workers=int(getattr(cfg, 'self_past_workers', 4)))
+                      num_workers=int(getattr(cfg, 'self_past_workers', 4)),
+                      batch_seqs=int(getattr(cfg, 'self_past_batch', 16)))
             k = max(1, round(float(getattr(cfg, 'self_past_subset', 0.3)) * len(self._sp_train)))
             chosen = rng.sample(self._sp_train, min(k, len(self._sp_train)))
             ds, seqs = self._sp_rollout_dataset(chosen)
@@ -1218,10 +1132,8 @@ class PastConditionedTrainer(BaseTrainer):
                 _, s_val = rollout_closed_loop(self.model, self.image_processor, cfg, self.device, ds,
                                                seqs, keep_keys=set(), desc="rollout val", **kw)
             del ds, seqs
-            _gc.collect()     # finestre del rollout liberate prima che i worker del training vengano forkati
-            # Aggregazione stile DAgger: le sequenze rifatte ora sostituiscono le vecchie, le altre restano
-            # (passato di un modello un po' più vecchio). Senza, solo self_past_subset dei frame avrebbe una
-            # finestra closed-loop e l'esposizione effettiva sarebbe p·subset.
+            _gc.collect()     # libera la RAM prima del fork dei worker
+            # le sequenze rifatte sostituiscono le vecchie, le altre restano
             if getattr(cfg, 'self_past_aggregate', 1) and self._self_past['cache']:
                 merged = dict(self._self_past['cache'])
                 merged.update(cache)
@@ -1247,7 +1159,7 @@ class PastConditionedTrainer(BaseTrainer):
                 if s_val is not None:
                     _log.update({f"self_past/val_{k_}": v for k_, v in s_val.items() if v is not None})
                 wandb.log(_log, step=self.global_step)
-        # p dell'epoca: qualità misurata sul val (o sul train se il val non la misura)
+        # p dell'epoca dalla qualità sul val (o sul train)
         q_ref = st['q_val'] if st.get('q_val') is not None else st.get('q_train')
         m_ref = st['map_val'] if st.get('map_val') is not None else st.get('map_train')
         st['p'], st['r'], why = schedule_p(
@@ -1268,7 +1180,7 @@ class PastConditionedTrainer(BaseTrainer):
         if self.model is None:
             self.setup()
 
-        # ── Resume: carica il checkpoint DOPO setup (model/optimizer/scheduler pronti) ──
+        # resume dopo il setup
         resume_path = getattr(self.config, 'resume_from_checkpoint', '')
         if resume_path:
             if os.path.exists(resume_path):
@@ -1302,7 +1214,7 @@ class PastConditionedTrainer(BaseTrainer):
 
             self.current_epoch = epoch
 
-            # Training curriculum: rollout closed-loop + p dell'epoca (no-op se use_self_past=0)
+            # curriculum closed-loop (no-op se use_self_past=0)
             self._refresh_self_past(epoch)
 
             # Train
@@ -1322,7 +1234,7 @@ class PastConditionedTrainer(BaseTrainer):
                 self.val_losses.append(val_loss)
                 _selname = 'val_loc (senza cls)' if getattr(self.config, 'select_exclude_cls', 0) else 'val_loss'
 
-                # Early Stopping (sul metric di selezione: val_loc se select_exclude_cls=1)
+                # Early Stopping
                 if val_loss < self.best_val_loss:
                     print(f"New Best [{_selname}]: {val_loss:.4f} (was {self.best_val_loss:.4f})")
                     self.best_val_loss = val_loss
@@ -1379,7 +1291,7 @@ class PastConditionedTrainer(BaseTrainer):
             past_boxes = batch['past_boxes'].to(self.device)
             past_mask = batch['past_mask'].to(self.device)
 
-            # Forward pass (past_mask ora passato!)
+            # Forward pass
             outputs = self.model(
                 event_frames=frames_dict,
                 labels=detr_labels,
@@ -1404,7 +1316,7 @@ class PastConditionedTrainer(BaseTrainer):
 
             box_pred_list, box_gt_list = [], []
             cls_logits_list, cls_targets_list = [], []
-            # Proposta C: refine-loss solo con use_present_refine attivo (vedi _train_epoch)
+            # refine-loss solo con use_present_refine
             present_refined = outputs.present_refined if getattr(self.config, 'use_present_refine', 1) else None
             refined_pred_list, refined_gt_list = [], []
             num_pos = 0
@@ -1469,7 +1381,7 @@ class PastConditionedTrainer(BaseTrainer):
                 pred_flat = torch.cat(box_pred_list, dim=0)
                 gt_flat = torch.cat(box_gt_list, dim=0)
                 loss_bbox = F.l1_loss(pred_flat, gt_flat, reduction='sum') / max(num_pos, 1)
-                # RIFERIMENTO (approccio precedente O(N²)):
+                # versione precedente:
                 # giou_diag = generalized_box_iou(
                 #     center_to_corners_format(pred_flat),
                 #     center_to_corners_format(gt_flat),
@@ -1487,7 +1399,7 @@ class PastConditionedTrainer(BaseTrainer):
                 cls_targets = torch.cat(cls_targets_list, dim=0)
                 loss_cls = sigmoid_focal_loss(cls_logits, cls_targets, num_pos)
 
-            # ── Present-refinement (Proposta C) — stessa loss del train ──
+            # present refinement, come nel train
             loss_present_refine = torch.zeros((), device=device)
             if len(refined_pred_list) > 0:
                 rp = torch.cat(refined_pred_list, dim=0)
@@ -1501,7 +1413,7 @@ class PastConditionedTrainer(BaseTrainer):
                 loss_ref_giou = (1 - giou_ref).sum() / num_ref
                 loss_present_refine = loss_ref_l1 * 5.0 + loss_ref_giou * 2.0
 
-            # ── Forecasting (passo 3): stessa loss del train, così best-model lo segue ──
+            # forecasting, come nel train
             loss_forecast = torch.zeros((), device=device)
             future_gt = batch.get('future_gt', None)
             future_boxes = outputs.future_boxes
@@ -1513,7 +1425,7 @@ class PastConditionedTrainer(BaseTrainer):
                 if future_mask.any():
                     pred_sel = fp[future_mask]
                     gt_sel   = future_gt[future_mask]
-                    # Weighting progressivo per-step (identico al train, così il best-model lo segue).
+                    # peso crescente con lo step
                     T_fut = fp.shape[2]
                     w_max = float(getattr(self.config, 'forecast_step_weight_max', 3.0))
                     step_w = 1.0 + (torch.arange(1, T_fut + 1, device=device, dtype=fp.dtype) / T_fut) * (w_max - 1.0)
@@ -1546,13 +1458,10 @@ class PastConditionedTrainer(BaseTrainer):
         num_batches = len(self.val_loader)
         n = max(num_batches, 1)
         avg_val_loss = val_loss / n
-        # val_loc = totale SENZA la cls (che sale per calibrazione e avvelena la selezione del
-        # checkpoint). La cls resta nel TRAINING; qui la togliamo SOLO dal criterio di best/early-stop
-        # se select_exclude_cls=1. val_loc = 5·bbox + 2·giou + fw·forecast + rw·refine.
+        # val_loc = loss senza la cls (criterio di selezione con select_exclude_cls=1)
         avg_val_loc = avg_val_loss - (val_loss_cls / n)
 
-        # Un solo log di validazione per epoca, allo stesso global_step del train
-        # (fine epoca): niente più campo "step" alternativo → asse x coerente.
+        # un log di validazione per epoca, allo stesso global_step del train
         if self.config.use_wandb and self.run is not None:
             import wandb
             wandb.log({
@@ -1566,7 +1475,7 @@ class PastConditionedTrainer(BaseTrainer):
                 "val/loss_present_refine": val_loss_present_refine / n,
                 "val/learning_rate": self.optimizer.param_groups[0]['lr'],
             }, step=self.global_step)
-        # metric di SELEZIONE: val_loc (senza cls) se richiesto, altrimenti il totale (default)
+        # metrica di selezione
         return avg_val_loc if getattr(self.config, 'select_exclude_cls', 0) else avg_val_loss
         
 
@@ -1589,8 +1498,8 @@ class PastConditionedTrainer(BaseTrainer):
             '#FF69B4', '#00CED1', '#FF6347', '#BA55D3', '#FFA07A',
         ]
         GT_COLOR = '#00FF00'
-        FUTURE_GT_COLOR = '#00B050'   # verde medio — box GT future (sfumate)
-        FORECAST_COLOR  = '#FF3333'   # rosso       — box future predette (sfumate)
+        FUTURE_GT_COLOR = '#00B050'   # box GT future
+        FORECAST_COLOR  = '#FF3333'   # box future predette
 
         self.model.eval()
 
@@ -1698,10 +1607,9 @@ class PastConditionedTrainer(BaseTrainer):
                         if pred_idx >= 10:
                             break  # limit to top 10 predictions for visualization
 
-                # ── Forecasting: future GT (verde medio) + future predette (rosso) ──
                 N = past_boxes.shape[1]   # query-passato (droni tracciati)
 
-                # Future GT (verde medio, tratteggiate, sfumate nel tempo)
+                # future GT, tratteggiate
                 if future_gt is not None and future_mask is not None:
                     fgt = future_gt[-1].cpu().numpy()     # (M, T, 4) cxcywh norm
                     fm  = future_mask[-1].cpu().numpy()   # (M, T) bool
@@ -1722,7 +1630,7 @@ class PastConditionedTrainer(BaseTrainer):
                     if drew_gt:
                         legend_entries.append((FUTURE_GT_COLOR, "Future GT"))
 
-                # Future predette dalla forecasting head (rosso, sfumate nel tempo)
+                # future predette
                 fut_pred = getattr(outputs, 'future_boxes', None)
                 if fut_pred is not None:
                     fp = fut_pred[-1, :N].cpu().numpy()   # (N, T, 4) cxcywh norm
@@ -1766,4 +1674,4 @@ class PastConditionedTrainer(BaseTrainer):
 
         print(f"  Saved: {filename}")
 
-        self._set_model_mode()   # ripristina eval()/train() coerente col freeze
+        self._set_model_mode()

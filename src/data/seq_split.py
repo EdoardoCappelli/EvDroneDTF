@@ -5,16 +5,7 @@ import hashlib
 
 
 def sequence_holdout(windows, split, val_frac=0.15, seed=42):
-    """Filtra `windows` (lista di dict con chiave 'hdf5_path') tenendo train o val per SEQUENZA.
-
-    Args:
-        windows: lista di finestre (ognuna con 'hdf5_path' = la sequenza).
-        split: 'train' → sequenze NON-val ; 'val' → sequenze val ; altro → invariato 
-        val_frac: frazione (attesa) delle sequenze uniche assegnate al val 
-
-    Returns:
-        la sotto-lista di `windows` appartenente allo split richiesto.
-    """
+    """Tiene le finestre delle sequenze di train o di val (split per hdf5_path)."""
     if split not in ('train', 'val'):
         return windows
 

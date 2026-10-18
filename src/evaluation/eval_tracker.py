@@ -3,8 +3,7 @@ import os
 import pandas as pd
 import numpy as np
 
-# Compat NumPy 2.0: motmetrics chiama np.asfarray (rimosso in NumPy 2.0). Shim locale, così
-# non serve fare downgrade di numpy (romperebbe l'ABI di torch/pandas nell'ambiente FRED++).
+# np.asfarray non esiste più in NumPy 2.0
 if not hasattr(np, 'asfarray'):
     np.asfarray = lambda a, dtype=np.float64: np.asarray(a, dtype=dtype)
 

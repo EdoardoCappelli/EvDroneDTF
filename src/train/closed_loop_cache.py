@@ -1,15 +1,8 @@
 """
-Training curriculum con il passato prodotto dal modello
+Passato closed-loop per il training (use_self_past).
 
-Ogni tanto il trainer (PastConditionedTrainer._refresh_self_past) fa girare il modello corrente in
-eval + no_grad, in CLOSED LOOP con lo stesso tracker dell'inferenza (evaluation/closed_loop.py), su
-un sottoinsieme di sequenze di training. Per ogni frame di training salva:
-  - le finestre che il tracker darebbe come query-passato in quel frame (N, P, 4), come in inferenza
-    (track confermati, frame persi, fantasmi, doppioni compresi);
-  - per ogni finestra il drone GT corrispondente (matching ungherese fra l'ANCORA, cioè la box più
-    recente, e i droni presenti, IoU ≥ match_iou) oppure -1 = sfondo.
-Il collate del training, con probabilità p, usa queste finestre al posto del passato GT. I TARGET
-restano sempre GT (box presente + futuro del drone abbinato; sfondo per le finestre -1).
+Il modello gira in closed loop col tracker dell'eval su alcune sequenze di training; per ogni frame si
+salvano le finestre date come query-passato e il drone GT abbinato a ciascuna (-1 = sfondo).
 """
 import functools
 import time
@@ -18,16 +11,14 @@ from collections import deque
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 from data.datasets.event_dataset_forecasting import frame_key
 from evaluation.closed_loop import LegacyTracker, box_iou_cxcywh
 
 
 def match_windows(anchors, gt_boxes, iou_thr):
-    """Matching ungherese ancora (box più recente della finestra) ↔ droni presenti.
-    anchors (N, 4), gt_boxes (M, 4) cxcywh normalizzate. Ritorna, per ogni finestra, l'indice del
-    drone abbinato (IoU ≥ iou_thr) oppure -1."""
+    """Hungarian fra la box più recente di ogni finestra e i droni presenti: indice del drone o -1."""
     out = [-1] * len(anchors)
     if len(anchors) == 0 or len(gt_boxes) == 0:
         return out
@@ -40,7 +31,7 @@ def match_windows(anchors, gt_boxes, iou_thr):
 
 
 def sequences_in_order(windows):
-    """{hdf5_path: [indici delle finestre in ordine temporale]} (ordine di prima apparizione)."""
+    """{hdf5_path: indici delle finestre in ordine temporale}."""
     seqs = {}
     for i, w in enumerate(windows):
         seqs.setdefault(w['hdf5_path'], []).append(i)
@@ -50,139 +41,170 @@ def sequences_in_order(windows):
 
 
 def _make_tracker(config, P):
-    """Lo stesso tracker dell'eval closed-loop (ar_tracker: legacy | tracktrack)."""
+    """Tracker dell'eval closed-loop (legacy o tracktrack)."""
     if str(getattr(config, 'ar_tracker', 'legacy')).lower() == 'tracktrack':
         from evaluation.tracktrack_ar import TrackTrackAR, TTConfig
         return TrackTrackAR(TTConfig.from_config(config), P), True
     return LegacyTracker.from_config(config, P), False
 
 
+def _lane_schedule(seq_list, n_lanes):
+    """Passi del rollout: ogni corsia segue una sequenza alla volta, un frame per corsia a ogni passo."""
+    queue = [k for k, (_, idx) in enumerate(seq_list) if len(idx) > 0]
+    lanes = [None] * n_lanes                         # (k sequenza, prossima posizione) o None
+    steps = []
+    while True:
+        for l in range(n_lanes):
+            if lanes[l] is not None and lanes[l][1] >= len(seq_list[lanes[l][0]][1]):
+                lanes[l] = None                      # sequenza finita
+            if lanes[l] is None and queue:
+                lanes[l] = (queue.pop(0), 0)         # prossima sequenza della coda
+        step = [(l, k, p, seq_list[k][1][p]) for l, lane in enumerate(lanes) if lane is not None
+                for k, p in (lane,)]
+        if not step:
+            return steps
+        steps.append(step)
+        lanes = [None if lane is None else (lane[0], lane[1] + 1) for lane in lanes]
+
+
+def _collate_step(batch, image_processor, num_past):
+    """Frame di un passo impilati per durata, con la GT di ciascuno (preprocessing dell'eval AR)."""
+    from evaluation.evaluators.evaluator_rtdetrv2_past_conditioned import collate_autoregressive
+    outs = [collate_autoregressive([item], image_processor=image_processor, num_past=num_past) for item in batch]
+    frames = {d: torch.cat([o[0][d] for o in outs], dim=0) for d in outs[0][0]}
+    return frames, [(o[1], o[2]) for o in outs]
+
+
 @torch.no_grad()
 def rollout_closed_loop(model, image_processor, config, device, dataset, seqs, keep_keys=None,
-                        match_iou=0.1, max_frames=0, num_workers=0, desc="rollout"):
-    """Closed loop del modello sulle sequenze `seqs` ({hdf5_path: [indici in ordine]} di `dataset`,
-    che deve avere frame consecutivi: subsample=1).
+                        match_iou=0.1, max_frames=0, num_workers=0, desc="rollout", batch_seqs=1):
+    """Closed loop del modello sulle sequenze `seqs` di `dataset` (subsample=1).
 
-    keep_keys: frame_key da salvare in cache (None = tutti; set() = nessuno, solo statistiche).
-    Ritorna (cache, stats):
-      cache[frame_key] = (finestre float32 (N, P, 4) indice 0 = più recente, target_id int64 (N,), -1 = sfondo)
-      stats: frame, finestre, abbinate, fantasmi (non abbinate), q (IoU medio box della finestra ↔ GT
-             del drone abbinato negli stessi frame; None se nessuna finestra abbinata), anchor_iou,
-             coverage (droni presenti con finestra), map / map50 del closed loop (box emesse dal tracker,
-             come 'map'/'map_50' di evaluate_autoregressive, frame vuoti compresi)."""
-    from evaluation.evaluators.evaluator_rtdetrv2_past_conditioned import collate_autoregressive
+    batch_seqs: sequenze avanzate in parallelo, ognuna col suo tracker. keep_keys: frame da salvare
+    (None = tutti, set() = solo statistiche). Ritorna (cache, stats), con
+    cache[frame_key] = (finestre (N, P, 4), id GT di ogni finestra o -1).
+    """
     from torchmetrics.detection import MeanAveragePrecision
 
     P = int(getattr(config, 'num_past_annotations', 12))
-    tracker, use_tt = _make_tracker(config, P)
-    order, owner = [], []
-    for path, idx in seqs.items():
-        idx = idx[:max_frames] if max_frames and max_frames > 0 else idx
-        order += idx
-        owner += [path] * len(idx)
+    seq_list = [(path, idx[:max_frames] if max_frames and max_frames > 0 else idx) for path, idx in seqs.items()]
+    n_frames = sum(len(idx) for _, idx in seq_list)
+    n_lanes = max(1, min(int(batch_seqs), len(seq_list)))
+    steps = _lane_schedule(seq_list, n_lanes)
     loader = DataLoader(
-        Subset(dataset, order), batch_size=1, shuffle=False, num_workers=num_workers,
-        collate_fn=functools.partial(collate_autoregressive, image_processor=image_processor, num_past=P),
+        dataset, batch_sampler=[[s[3] for s in step] for step in steps], num_workers=num_workers,
+        collate_fn=functools.partial(_collate_step, image_processor=image_processor, num_past=P),
     )
+    lanes = []
+    for _ in range(n_lanes):
+        tracker, use_tt = _make_tracker(config, P)
+        lanes.append({'tracker': tracker, 'hist': deque(maxlen=P)})   # hist[k] = {id: box} GT al frame t-1-k
 
     W = float(getattr(config, 'img_width', 1280))
     H = float(getattr(config, 'img_height', 720))
 
-    def to_xyxy(b):   # (N, 4) cxcywh normalizzate → tensor (N, 4) xyxy pixel
+    def to_xyxy(b):   # cxcywh normalizzate -> xyxy pixel
         b = torch.as_tensor(np.asarray(b, dtype=np.float32)).reshape(-1, 4)
         cx, cy, w, h = b.unbind(-1)
         return torch.stack([(cx - w / 2) * W, (cy - h / 2) * H, (cx + w / 2) * W, (cy + h / 2) * H], dim=-1)
 
-    metric = MeanAveragePrecision(iou_type='bbox')   # mAP del sistema in closed loop (box emesse dal tracker)
+    metric = MeanAveragePrecision(iou_type='bbox')   # mAP del sistema (box emesse dal tracker)
+    pending = {}      # (k, posizione) -> (pred, gt), aggiunti alla mAP alla fine
     was_training = model.training
     model.eval()
     cache = {}
     st = dict(frames=0, windows=0, matched=0, ghosts=0, gt=0, gt_covered=0,
               q_sum=0.0, q_n=0, anchor_sum=0.0)
-    hist = deque(maxlen=P)        # GT dei P frame precedenti: hist[k] = {id: box} al frame t-1-k
-    prev = None
     t0 = time.time()
     try:
-        for n, batch in enumerate(loader):
-            seq = owner[n]
-            if seq != prev:
-                tracker.reset()
-                hist.clear()
-                prev = seq
-            frames_dict, present_labels, present_ids = batch[0], batch[1], batch[2]
-            gt_boxes = present_labels[0]['boxes'].float().numpy() if present_labels else np.zeros((0, 4), np.float32)
-            gt_all = gt_boxes                       # tutti i droni presenti: GT della mAP (come l'eval)
-            gt_ids = np.asarray(present_ids, dtype=np.int64)
-            n_pair = min(len(gt_ids), len(gt_boxes))
-            gt_boxes, gt_ids = gt_boxes[:n_pair], gt_ids[:n_pair]
+        for step, (frames_dict, gts) in zip(steps, loader):
+            rows = []
+            for (l, k, p, didx), (present_labels, present_ids) in zip(step, gts):
+                lane = lanes[l]
+                if p == 0:                           # la corsia comincia una sequenza nuova
+                    lane['tracker'].reset()
+                    lane['hist'].clear()
+                gt_boxes = present_labels[0]['boxes'].float().numpy() if present_labels else np.zeros((0, 4), np.float32)
+                gt_all = gt_boxes                    # GT della mAP: tutti i droni presenti
+                gt_ids = np.asarray(present_ids, dtype=np.int64)
+                n_pair = min(len(gt_ids), len(gt_boxes))
+                gt_boxes, gt_ids = gt_boxes[:n_pair], gt_ids[:n_pair]
 
-            # ── query-passato del frame: esattamente quelle dell'inferenza ──
-            valid = tracker.query_tracks()
-            arr = np.asarray(tracker.query_array(valid), dtype=np.float32)          # (N, P, 4)
+                # query-passato del frame, come in inferenza
+                valid = lane['tracker'].query_tracks()
+                arr = np.asarray(lane['tracker'].query_array(valid), dtype=np.float32)      # (N, P, 4)
 
-            # ── target: ancora ↔ droni presenti; statistiche sulla qualità del passato ──
-            m = match_windows(arr[:, 0], gt_boxes, match_iou) if len(arr) else []
-            tids = np.array([int(gt_ids[j]) if j >= 0 else -1 for j in m], dtype=np.int64)
-            st['frames'] += 1
-            st['windows'] += len(arr)
-            st['ghosts'] += int((tids < 0).sum())
-            st['gt'] += n_pair
-            st['gt_covered'] += int((tids >= 0).sum())
-            for i, j in enumerate(m):
-                if j < 0:
-                    continue
-                st['matched'] += 1
-                st['anchor_sum'] += box_iou_cxcywh(arr[i, 0], gt_boxes[j])
-                tid = int(tids[i])
-                ious = [box_iou_cxcywh(arr[i, k], hist[k][tid])
-                        for k in range(min(P, len(hist))) if tid in hist[k]]
-                if ious:
-                    st['q_sum'] += float(np.mean(ious))
-                    st['q_n'] += 1
-            key = frame_key(dataset.windows[order[n]])
-            if keep_keys is None or key in keep_keys:
-                cache[key] = (arr.copy(), tids)
+                # target delle finestre e qualità del passato
+                m = match_windows(arr[:, 0], gt_boxes, match_iou) if len(arr) else []
+                tids = np.array([int(gt_ids[j]) if j >= 0 else -1 for j in m], dtype=np.int64)
+                st['frames'] += 1
+                st['windows'] += len(arr)
+                st['ghosts'] += int((tids < 0).sum())
+                st['gt'] += n_pair
+                st['gt_covered'] += int((tids >= 0).sum())
+                hist = lane['hist']
+                for i, j in enumerate(m):
+                    if j < 0:
+                        continue
+                    st['matched'] += 1
+                    st['anchor_sum'] += box_iou_cxcywh(arr[i, 0], gt_boxes[j])
+                    tid = int(tids[i])
+                    ious = [box_iou_cxcywh(arr[i, kk], hist[kk][tid])
+                            for kk in range(min(P, len(hist))) if tid in hist[kk]]
+                    if ious:
+                        st['q_sum'] += float(np.mean(ious))
+                        st['q_n'] += 1
+                key = frame_key(dataset.windows[didx])
+                if keep_keys is None or key in keep_keys:
+                    cache[key] = (arr.copy(), tids)
+                rows.append((lane, k, p, valid, arr, gt_all, gt_ids, gt_boxes))
 
-            # ── forward + update del tracker (come evaluate_autoregressive) ──
-            fd = {d: f.to(device) for d, f in frames_dict.items()}
-            past_boxes = torch.from_numpy(arr).float().unsqueeze(0).to(device)
-            past_mask = torch.zeros(1, past_boxes.shape[1], dtype=torch.bool, device=device)
-            out = model(event_frames=fd, past_boxes=past_boxes, past_mask=past_mask, query_mode='both')
-            if out.pred_boxes.shape[1] > 0:
-                scores = out.logits[0].sigmoid().squeeze(-1).float().cpu().numpy()
-                boxes = out.pred_boxes[0].float().cpu().numpy()
-            else:
-                scores, boxes = np.zeros(0, np.float32), np.zeros((0, 4), np.float32)
-            N = past_boxes.shape[1]
-            past_b, past_s, std_b, std_s = boxes[:N], scores[:N], boxes[N:], scores[N:]
-            if use_tt:
-                fut = (out.future_boxes[0, :N].float().cpu().numpy()
-                       if out.future_boxes is not None and N > 0 else None)
-                emb_p = emb_s = None
-                if tracker.cfg.w_app > 0 and getattr(out, 'hidden_states', None) is not None:
-                    hs = out.hidden_states[0].detach().float().cpu().numpy()
-                    emb_p, emb_s = hs[:N], hs[N:]
-                dets, _ = tracker.step(past_b, past_s, std_b, std_s, valid, fut, emb_p, emb_s)
-            else:
-                fc_next = (out.future_boxes[0, :N, 0].float().cpu().numpy()
-                           if out.future_boxes is not None and N > 0 else None)
-                dets, _, _ = tracker.step(past_b, past_s, std_b, std_s, valid, fc_next)
-            # mAP del sistema: le box emesse dal tracker (score già > ar_conf_thr), come in evaluate_autoregressive
-            metric.update(
-                [{'boxes': to_xyxy([d[0] for d in dets]), 'scores': torch.tensor([float(d[1]) for d in dets]),
-                  'labels': torch.zeros(len(dets), dtype=torch.long)}],
-                [{'boxes': to_xyxy(gt_all), 'labels': torch.zeros(len(gt_all), dtype=torch.long)}],
-            )
-
-            hist.appendleft({int(i): b for i, b in zip(gt_ids, gt_boxes)})
-            if (n + 1) % 2000 == 0:
-                print(f"  [{desc}] {n + 1}/{len(order)} frame ({time.time() - t0:.0f}s)", flush=True)
+            # forward per gruppi con lo stesso N: niente padding, la forecasting head non maschera gli slot
+            groups = {}
+            for j, row in enumerate(rows):
+                groups.setdefault(len(row[4]), []).append(j)
+            for N, js in groups.items():
+                sel = torch.as_tensor(js, dtype=torch.long)
+                fd = {d: f[sel].to(device) for d, f in frames_dict.items()}
+                past_boxes = torch.from_numpy(np.stack([rows[j][4] for j in js])).float().to(device)  # (G, N, P, 4)
+                past_mask = torch.zeros(len(js), N, dtype=torch.bool, device=device)
+                out = model(event_frames=fd, past_boxes=past_boxes, past_mask=past_mask, query_mode='both')
+                for g, j in enumerate(js):
+                    lane, k, p, valid, arr, gt_all, gt_ids, gt_boxes = rows[j]
+                    tracker = lane['tracker']
+                    if out.pred_boxes.shape[1] > 0:
+                        scores = out.logits[g].sigmoid().squeeze(-1).float().cpu().numpy()
+                        boxes = out.pred_boxes[g].float().cpu().numpy()
+                    else:
+                        scores, boxes = np.zeros(0, np.float32), np.zeros((0, 4), np.float32)
+                    past_b, past_s, std_b, std_s = boxes[:N], scores[:N], boxes[N:], scores[N:]
+                    if use_tt:
+                        fut = (out.future_boxes[g, :N].float().cpu().numpy()
+                               if out.future_boxes is not None and N > 0 else None)
+                        emb_p = emb_s = None
+                        if tracker.cfg.w_app > 0 and getattr(out, 'hidden_states', None) is not None:
+                            hs = out.hidden_states[g].detach().float().cpu().numpy()
+                            emb_p, emb_s = hs[:N], hs[N:]
+                        dets, _ = tracker.step(past_b, past_s, std_b, std_s, valid, fut, emb_p, emb_s)
+                    else:
+                        fc_next = (out.future_boxes[g, :N, 0].float().cpu().numpy()
+                                   if out.future_boxes is not None and N > 0 else None)
+                        dets, _, _ = tracker.step(past_b, past_s, std_b, std_s, valid, fc_next)
+                    pending[(k, p)] = (
+                        {'boxes': to_xyxy([d[0] for d in dets]), 'scores': torch.tensor([float(d[1]) for d in dets]),
+                         'labels': torch.zeros(len(dets), dtype=torch.long)},
+                        {'boxes': to_xyxy(gt_all), 'labels': torch.zeros(len(gt_all), dtype=torch.long)},
+                    )
+                    lane['hist'].appendleft({int(i): b for i, b in zip(gt_ids, gt_boxes)})
+            if st['frames'] // 2000 > (st['frames'] - len(step)) // 2000:
+                print(f"  [{desc}] {st['frames']}/{n_frames} frame ({time.time() - t0:.0f}s)", flush=True)
     finally:
         model.train(was_training)
 
+    for key in sorted(pending):          # ordine sequenziale
+        metric.update([pending[key][0]], [pending[key][1]])
     mres = metric.compute() if st['frames'] else {}
-    # q / anchor_iou = None se non c'è nessuna finestra abbinata (es. tracker che non conferma track
-    # sulla sequenza): "non misurabile", non "pessimo" → il trainer ripiega sul q del training.
+    # q e anchor_iou restano None se nessuna finestra è abbinata
     stats = dict(
         map=float(mres['map']) if 'map' in mres else None,
         map50=float(mres['map_50']) if 'map_50' in mres else None,
@@ -204,14 +226,8 @@ def _fmt(v):
 
 
 def schedule_p(schedule, r, q_ref, map_ref, epoch, epochs, q_min=0.6, step=0.05, p_max=0.8, floor=0.0):
-    """Probabilità p che un frame di training usi il passato closed-loop (il resto usa il passato GT).
-    Ritorna (p, r aggiornato, spiegazione per il log).
-      ramp:        r += step se q_ref ≥ q_min, altrimenti r resta; p = min(p_max, r)
-      product_iou: p = min(p_max, max(q_ref, floor) · (epoch+1)/epochs)
-      product_map: p = min(p_max, max(map_ref, floor) · (epoch+1)/epochs)
-    q_ref: IoU medio finestra closed-loop ↔ GT; map_ref: mAP50 del closed loop (box del tracker), entrambi
-    dall'ultimo rollout (val, o train se il val non li misura). None (non misurabile) vale 0, + floor.
-    floor = 0.5 riproduce la formula max(map_val, 0.5)·epoch/epochs."""
+    """Probabilità p di usare il passato closed-loop. Ritorna (p, r aggiornato, testo per il log).
+    ramp: r += step se q_ref >= q_min. product_iou / product_map: p = max(ref, floor) * (epoch+1) / epochs."""
     if schedule == 'ramp':
         if q_ref is not None and q_ref >= q_min:
             r = min(1.0, r + step)

@@ -62,8 +62,7 @@ def get_dataset(name, split="train", modality='detection', config=None):
                 num_future_annotations=getattr(config, 'num_future_annotations', 0),
             )
 
-    # ── Split train/val ──
-    # train e val caricano lo STESSO train_windows, poi qui si tengono sequenze disgiunte.
+    # split train/val: stesso train_windows, sequenze disgiunte
     if split in ('train', 'val') and dataset is not None:
         from data.seq_split import sequence_holdout
         _n0 = len(dataset.windows)

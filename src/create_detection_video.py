@@ -28,16 +28,12 @@ from data.datasets.event_dataset_forecasting import FREDMultiDurationTensorDatas
 from models.Multiscale_ERT_Detr import MultiDurationRTDetrAttention
 
 
-# ── Palette colori ─────────────────────────────────────────────────────────────
-C_PAST_GT = '#4169E1'   # blu       — traiettoria predetta (track NON usato come past)
-C_TRACK_USED = '#FFD700'   # giallo    — traccia valida, effettivamente usata come past input
-C_PRESENT_GT = '#00FF00'   # verde     — box GT presente (verità)
-C_PRED = '#FF8C00'   # arancione — detection predette
+# colori
+C_PAST_GT = '#4169E1'   # track non usato come passato
+C_TRACK_USED = '#FFD700'   # track valido, usato come passato
+C_PRESENT_GT = '#00FF00'   # GT presente
+C_PRED = '#FF8C00'   # detection
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# GEOMETRY UTILS
-# ══════════════════════════════════════════════════════════════════════════════
 
 def box_iou_cxcywh(a: np.ndarray, b: np.ndarray) -> float:
     """IoU tra due box (4,) cxcywh normalizzate."""
@@ -58,7 +54,7 @@ def box_center_dist(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def cxcywh_to_xyxy(boxes: torch.Tensor, img_w: int, img_h: int) -> torch.Tensor:
-    """(N,4) cxcywh norm → (N,4) xyxy pixel (per l'NMS)."""
+    """(N,4) cxcywh norm -> (N,4) xyxy pixel."""
     cx, cy, bw, bh = boxes.unbind(-1)
     return torch.stack([
         (cx - bw / 2) * img_w,
@@ -68,24 +64,12 @@ def cxcywh_to_xyxy(boxes: torch.Tensor, img_w: int, img_h: int) -> torch.Tensor:
     ], dim=-1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TRACKER
-# ══════════════════════════════════════════════════════════════════════════════
-
 class Track:
-    """
-    Finestra scorrevole delle ultime P box predette dal modello.
-
-    Le box nel deque sono ordinate dalla più vecchia (indice 0) alla più
-    recente (indice -1), in modo da poter calcolare la velocità come
-    differenza tra gli ultimi due elementi.
-    """
+    """Ultime P box predette (indice 0 = più vecchia)."""
     def __init__(self, box: np.ndarray, score: float, P: int):
         self.boxes = deque([box], maxlen=P)
         self.scores = deque([score], maxlen=P)
         self.missed = 0
-
-    # ── Stato ──────────────────────────────────────────────────────────────────
 
     def update(self, box: np.ndarray, score: float) -> None:
         self.boxes.append(box)
@@ -99,24 +83,14 @@ class Track:
 
     @property
     def predicted_next(self) -> np.ndarray:
-        """
-        Posizione stimata al frame successivo per estrapolazione lineare.
-        Con un solo punto disponibile restituisce semplicemente l'ultimo box.
-        """
+        """Estrapolazione lineare al frame successivo."""
         if len(self.boxes) < 2:
             return self.last
         velocity = self.boxes[-1] - self.boxes[-2]          # (4,)
         return np.clip(self.last + velocity, 0.0, 1.0)
 
-    # ── Validità ───────────────────────────────────────────────────────────────
-
     def is_valid(self, P: int, conf_thr: float, coher_thr: float) -> bool:
-        """
-        Il track è valido (e può essere inviato al modello come past) se:
-          1. La finestra è piena (P box disponibili).
-          2. La confidenza media supera conf_thr.
-          3. Ogni coppia di box consecutive ha IoU >= coher_thr.
-        """
+        """Finestra piena, confidenza media >= conf_thr e IoU >= coher_thr fra box consecutive."""
         if len(self.boxes) < P:
             return False
         if float(np.mean(self.scores)) < conf_thr:
@@ -127,16 +101,10 @@ class Track:
             for a, b in zip(bs[:-1], bs[1:])
         )
 
-    # ── Esportazione ───────────────────────────────────────────────────────────
-
     def trajectory_recent_first(self, P: int) -> np.ndarray:
-        """(P, 4) con indice 0 = più recente — formato atteso dal modello."""
+        """(P, 4), indice 0 = più recente."""
         return np.stack(list(self.boxes)[::-1], axis=0)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MATCHING
-# ══════════════════════════════════════════════════════════════════════════════
 
 def best_match_track(
     tracks:   list,
@@ -145,20 +113,8 @@ def best_match_track(
     dist_thr: float,
     exclude:  set,
 ) -> 'Track | None':
-    """
-    Cerca il track esistente migliore per una detection, in due passaggi:
-
-    1. IoU tra la posizione PREDETTA del track e la nuova box.
-       Usa la proiezione con velocità, quindi funziona anche quando il drone
-       si è spostato molto tra un frame e l'altro.
-
-    2. Fallback su distanza euclidea tra centri (normalizzata).
-       Utile quando il drone è piccolo o si muove tanto e le box non si
-       sovrappongono affatto (IoU = 0 ovunque).
-
-    Restituisce None se nessun track supera entrambe le soglie.
-    """
-    # ── Passo 1: IoU sulla posizione predetta ───────────────────────────────
+    """Track per una detection: IoU con la posizione predetta, poi distanza fra i centri."""
+    # 1) IoU sulla posizione predetta
     best_iou, best_iou_track = iou_thr, None
     for t in tracks:
         if t in exclude:
@@ -169,7 +125,7 @@ def best_match_track(
     if best_iou_track is not None:
         return best_iou_track
 
-    # ── Passo 2: distanza euclidea tra centri (fallback) ────────────────────
+    # 2) distanza fra i centri
     best_dist, best_dist_track = dist_thr, None
     for t in tracks:
         if t in exclude:
@@ -180,20 +136,52 @@ def best_match_track(
     return best_dist_track
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# COLLATE  (batch_size = 1)
-# ══════════════════════════════════════════════════════════════════════════════
+def nms_std(std_b: np.ndarray, std_s: np.ndarray, conf_thr: float, nms_thr: float):
+    """NMS sulle detection standard sopra conf_thr, in ordine di score."""
+    keep = []
+    for i in np.argsort(-std_s):
+        if std_s[i] <= conf_thr:
+            break
+        if all(box_iou_cxcywh(std_b[i], std_b[j]) < nms_thr for j in keep):
+            keep.append(i)
+    return std_b[keep], std_s[keep]
+
+
+def duplicate_tracks(tracks: list, updated: set, nms_thr: float) -> set:
+    """Track aggiornati sovrapposti a un track più vecchio (doppioni da eliminare)."""
+    kept, dup = [], set()
+    for t in tracks:
+        if t in updated:
+            if any(box_iou_cxcywh(t.last, k.last) >= nms_thr for k in kept):
+                dup.add(t)
+            else:
+                kept.append(t)
+    return dup
+
+
+def add_tracker_args(p):
+    """--ar_tracker e un --ar_tt_<nome> per ogni campo di TTConfig."""
+    from dataclasses import fields
+    from evaluation.tracktrack_ar import TTConfig
+    p.add_argument('--ar_tracker', choices=['legacy', 'tracktrack'], default='legacy',
+                   help="tracker AR: 'legacy' (storico) | 'tracktrack' (TrackTrack-AR, TPA + TAI, CVPR 2025)")
+    for f in fields(TTConfig):
+        p.add_argument(f'--ar_tt_{f.name}', type=int if isinstance(f.default, bool) else type(f.default),
+                       default=None, help=f'TrackTrack-AR (solo con --ar_tracker tracktrack): default {f.default}')
+
+
+def make_tracktrack(args, P):
+    """TrackTrackAR configurato dagli --ar_tt_* (None con --ar_tracker legacy)."""
+    if getattr(args, 'ar_tracker', 'legacy') != 'tracktrack':
+        return None
+    from evaluation.tracktrack_ar import TrackTrackAR, TTConfig
+    cfg = TTConfig.from_config(args)
+    print(f'  Tracker AR: TrackTrack-AR  {cfg}')
+    return TrackTrackAR(cfg, P)
+
 
 def build_collate(image_processor, num_past: int):
-    """
-    Collate per la generazione video del detector past-conditioned.
-
-    Output (batch=1):
-        frames_dict     Dict[int, Tensor(1, C, H, W)]   frame normalizzati
-        present_labels  List[Dict]                       GT droni presenti (cxcywh norm)
-        past_boxes      Tensor(1, max_obj, P, 4)         traiettorie passate
-        past_mask       Tensor(1, max_obj) bool          True = padding
-    """
+    """Collate (batch=1): frames_dict, present_labels, past_boxes (1, max_obj, P, 4), past_mask."""
     def collate(batch):
         assert len(batch) == 1, "batch_size deve essere 1 per la generazione video"
         frames_raw, target = batch[0]
@@ -202,7 +190,7 @@ def build_collate(image_processor, num_past: int):
         past_ids_list = target.get('past_ids',   [])
         past_box_list = target.get('past_boxes', [])
 
-        # valid_ids = droni presenti ∩ presenti in TUTTI gli step passati
+        # droni presenti in tutti gli step passati
         if len(past_ids_list) == 0 or len(present_ids) == 0:
             valid_ids = []
         else:
@@ -263,10 +251,6 @@ def build_collate(image_processor, num_past: int):
     return collate
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RENDERING
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _base_frame(frames_dict: dict) -> np.ndarray:
     """Estrae il frame a durata massima come array HWC float [0,1]."""
     img = frames_dict[max(frames_dict.keys())][0].cpu().float().numpy()
@@ -300,11 +284,7 @@ def _frame_np(frames_dict: dict, d) -> np.ndarray:
 
 
 def _make_multi_fig(frames_dict: dict):
-    """
-    Figura multi-pannello: un pannello per durata (crescente), ciascuno mostra il
-    proprio frame accumulato. Ritorna (fig, main_ax), dove main_ax è il pannello
-    della durata MASSIMA — l'unico su cui si disegnano le box.
-    """
+    """Un pannello per durata; ritorna (fig, ax della durata massima, dove vanno le box)."""
     durs = sorted(frames_dict.keys())
     n = len(durs)
     fig, axes = plt.subplots(1, n, figsize=(5 * n, 5), constrained_layout=True)
@@ -356,15 +336,7 @@ def render(
     frame_idx: int, query_mode: str, score_thr: float, img_w: int, img_h: int,
     draw: str = 'both',
 ) -> np.ndarray:
-    """
-    Rendering modalità standard (passato GT):
-      - traiettoria GT passata (blu tratteggiato, fade con l'età)   [GT   → draw in gt/both]
-      - GT presente (verde)                                          [GT   → draw in gt/both]
-      - detection predette sopra soglia (arancione)                 [pred → draw in pred/both]
-    `draw`: 'gt' = solo ground-truth | 'pred' = solo predizioni/oracle | 'both' = sovrapposti.
-    I frame di TUTTE le accumulazioni sono mostrati affiancati; le box vengono
-    disegnate solo sul pannello della durata massima.
-    """
+    """Frame con passato GT: passato, GT presente e detection. draw: 'gt' | 'pred' | 'both'."""
     fig, ax = _make_multi_fig(frames_dict)
 
     # 1. Traiettoria GT passata (elemento GT)
@@ -415,18 +387,10 @@ def render_autoregressive(
     used_tracks: set, frame_idx: int, img_w: int, img_h: int,
     draw: str = 'both',
 ) -> np.ndarray:
-    """
-    Rendering modalità autoregressiva:
-      - traiettorie dei track predetti (blu=non usato, giallo=usato come past) [pred → draw in pred/both]
-      - GT presente (verde)                                                     [GT   → draw in gt/both]
-      - detection correnti con score (arancione)                               [pred → draw in pred/both]
-    `draw`: 'gt' = solo ground-truth | 'pred' = solo predizioni | 'both' = sovrapposti.
-    I frame di TUTTE le accumulazioni sono mostrati affiancati; le box vengono
-    disegnate solo sul pannello della durata massima.
-    """
+    """Frame autoregressivo: track, GT presente e detection. draw: 'gt' | 'pred' | 'both'."""
     fig, ax = _make_multi_fig(frames_dict)
 
-    # 1. Traiettorie dei track (predette → giallo=usato come past, blu=non usato)
+    # 1. track (giallo = usato come passato)
     for t in (tracks if draw in ('pred', 'both') else []):
         color = C_TRACK_USED if t in used_tracks else C_PAST_GT
         bs = list(t.boxes)
@@ -463,10 +427,6 @@ def render_autoregressive(
     )
     return _fig_to_bgr(fig)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SCAN — trova segmenti contigui single/multi drone
-# ══════════════════════════════════════════════════════════════════════════════
 
 def scan_segments(windows, want, min_len):
     """Run contigui (stessa sequenza) di frame single/multi-drone >= min_len.
@@ -513,10 +473,6 @@ def _run_scan(args):
                   f"avg_drones={avg:.2f}  seq={os.path.basename(seq)}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main(args):
     if args.scan:
         _run_scan(args)
@@ -525,13 +481,13 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}  |  query_mode: {args.query_mode}')
 
-    # ── Processor ──────────────────────────────────────────────────────────────
+    # processor
     image_processor = RTDetrImageProcessor.from_pretrained('PekingU/rtdetr_v2_r18vd')
     print("Using custom normalization")
     image_processor.image_mean = [0.007950919680297375, 0.010960247367620468, 0.013969575986266136]
     image_processor.image_std = [0.048023562878370285, 0.054145995527505875, 0.066846564412117]
 
-    # ── Modello ────────────────────────────────────────────────────────────────
+    # modello
     model = MultiDurationRTDetrAttention(
         checkpoint = 'PekingU/rtdetr_v2_r18vd',
         num_labels = 1,
@@ -551,7 +507,7 @@ def main(args):
     model.to(device).eval()
     print(f'Modello: {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M param')
 
-    # ── Dataset ────────────────────────────────────────────────────────────────
+    # dataset
     dataset = FREDMultiDurationTensorDatasetTracking(
         index_file = args.index,
         width = args.img_width,
@@ -580,8 +536,9 @@ def main(args):
     print(f'Dimensioni frame processor: {img_w}×{img_h}')
     del sample_frames
 
-    # ── Video writer ───────────────────────────────────────────────────────────
-    suffix = 'autoreg' if args.autoregressive else args.query_mode
+    # video writer
+    suffix = (('autoreg_tracktrack' if args.ar_tracker == 'tracktrack' else 'autoreg')
+              if args.autoregressive else args.query_mode)
     out_path = args.output.replace('.mp4', f'_{suffix}.mp4')
     raw_path = out_path.replace('.mp4', '_raw.avi')
     writer = None
@@ -590,13 +547,14 @@ def main(args):
     tracks: list[Track] = []
     prev_seq = None
     P = args.num_past_steps
+    tt = make_tracktrack(args, P) if args.autoregressive else None   # None = tracker legacy
 
     start = args.start_frame
     n_clip = args.clip_seconds * args.fps if args.clip_seconds > 0 else args.max_frames
     end = min(start + n_clip, len(dataset))
     print(f"Clip: frame [{start}, {end}) = {end - start} frame (~{(end - start)/args.fps:.0f}s @ {args.fps}fps)")
 
-    # Carica SOLO i frame della clip (evita di scorrere tutto il dataset fino a start)
+    # solo i frame della clip
     from torch.utils.data import Subset
     clip_loader = DataLoader(
         Subset(dataset, list(range(start, end))),
@@ -611,15 +569,23 @@ def main(args):
         frames_dict, present_labels, gt_past, gt_mask = batch
         frames_dict = {d: f.to(device) for d, f in frames_dict.items()}
 
-        # reset tracker al cambio sequenza (robustezza se la clip tocca un confine)
+        # reset del tracker al cambio di sequenza
         if args.autoregressive:
             seq_id = dataset.windows[idx]['hdf5_path']
             if seq_id != prev_seq:
                 tracks = []
+                if tt is not None:
+                    tt.reset()
                 prev_seq = seq_id
 
-        # ── Costruzione del passato ────────────────────────────────────────────
-        if args.autoregressive:
+        # passato
+        if args.autoregressive and tt is not None:
+            # track confermati, anche persi da pochi frame
+            valid = tt.query_tracks()
+            past_boxes = torch.from_numpy(tt.query_array(valid)).float().unsqueeze(0).to(device)
+            past_mask = torch.zeros(1, past_boxes.shape[1], dtype=torch.bool, device=device)
+            qmode = 'both'
+        elif args.autoregressive:
             valid = [t for t in tracks if t.is_valid(P, args.conf_thr, args.coher_thr)]
             if valid:
                 pb = np.stack([t.trajectory_recent_first(P) for t in valid], axis=0)
@@ -634,7 +600,7 @@ def main(args):
             past_mask = gt_mask.to(device)
             qmode = args.query_mode
 
-        # ── Inferenza ─────────────────────────────────────────────────────────
+        # inferenza
         with torch.no_grad():
             outputs = model(
                 event_frames = frames_dict,
@@ -650,13 +616,29 @@ def main(args):
             scores = torch.zeros(0, device=device)
             pred_boxes = torch.zeros(0, 4, device=device)
 
-        # ── Branch autoregressivo ──────────────────────────────────────────────
-        if args.autoregressive:
+        # AR con TrackTrack-AR
+        if args.autoregressive and tt is not None:
+            N = past_boxes.shape[1]
+            fut = (outputs.future_boxes[0, :N].detach().cpu().numpy()
+                   if getattr(outputs, 'future_boxes', None) is not None and N > 0 else None)
+            dets, _ = tt.step(pred_boxes[:N].cpu().numpy(), scores[:N].cpu().numpy(),
+                              pred_boxes[N:].cpu().numpy(), scores[N:].cpu().numpy(), valid, fut)
+            current_dets = [(b, float(s)) for b, s, _ in dets]   # box emesse dal tracker
+            tracks = tt.tracks
+            bgr = render_autoregressive(
+                frames_dict, present_labels, tracks, current_dets, set(valid), idx, img_w, img_h,
+                draw=args.draw,
+            )
+
+        # AR con il tracker legacy
+        elif args.autoregressive:
             N = past_boxes.shape[1]
             past_b = pred_boxes[:N].cpu().numpy()
             past_s = scores[:N].cpu().numpy()
             std_b = pred_boxes[N:].cpu().numpy()
             std_s = scores[N:].cpu().numpy()
+            # NMS sulle standard prima dell'associazione
+            std_b, std_s = nms_std(std_b, std_s, args.conf_thr, args.nms_threshold)
 
             updated:      set = set()
             current_dets: list = []
@@ -669,15 +651,13 @@ def main(args):
                     updated.add(t)
                     current_dets.append((b, float(s)))
                     past_det_boxes.append(b)
-                else:
-                    t.missed += 1
 
             # Associa le detection standard a track esistenti o crea nuovi
             for i in np.argsort(-std_s):
                 if std_s[i] <= args.conf_thr:
                     break
                 b, s = std_b[i], float(std_s[i])
-                # Le past query hanno priorità: scarto la standard se si sovrappone a una box del passato
+                # scarto le standard sovrapposte a una box del passato
                 if any(box_iou_cxcywh(b, pbx) >= args.std_past_iou_thr for pbx in past_det_boxes):
                     continue
                 m = best_match_track(tracks, b, args.iou_thr, args.dist_thr, exclude=updated)
@@ -691,6 +671,12 @@ def main(args):
                     updated.add(nt)
                     current_dets.append((b, s))
 
+            # NMS fra track (resta il più vecchio)
+            dup = duplicate_tracks(tracks, updated, args.nms_threshold)
+            if dup:
+                tracks = [t for t in tracks if t not in dup]
+                current_dets = [(t.last, float(t.scores[-1])) for t in tracks if t in updated]
+
             # Invecchiamento ed eliminazione track morti
             for t in tracks:
                 if t not in updated:
@@ -702,7 +688,7 @@ def main(args):
                 draw=args.draw,
             )
 
-        # ── Branch standard (GT past) ──────────────────────────────────────────
+        # passato GT
         else:
             if args.use_nms and pred_boxes.shape[0] > 0:
                 keep = tv_nms(
@@ -719,7 +705,7 @@ def main(args):
                 draw=args.draw,
             )
 
-        # ── Scrittura frame ────────────────────────────────────────────────────
+        # scrittura del frame
         if writer is None:
             h_px, w_px = bgr.shape[:2]
             writer = cv2.VideoWriter(
@@ -734,7 +720,7 @@ def main(args):
     print(f'\nFrame scritti: {n_written}  ({n_written / args.fps:.1f}s @ {args.fps}fps)')
     print(f'Video grezzo:  {raw_path}')
 
-    # ── Compressione H.264 via ffmpeg ──────────────────────────────────────────
+    # compressione H.264 con ffmpeg
     ffmpeg = args.ffmpeg
     has_ffmpeg = os.path.isfile(ffmpeg) or __import__('shutil').which(ffmpeg)
     if has_ffmpeg:
@@ -751,10 +737,6 @@ def main(args):
     else:
         print(f'  ffmpeg non trovato, mantengo il file grezzo: {raw_path}')
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -794,7 +776,9 @@ if __name__ == '__main__':
 
     # NMS
     p.add_argument('--use_nms',       type=int,   default=1)
-    p.add_argument('--nms_threshold', type=float, default=0.45)
+    p.add_argument('--nms_threshold', type=float, default=0.45,
+                   help='IoU della NMS: uscite del modello (non AR) e, in AR, standard doppie + '
+                        'track doppioni sullo stesso drone (sempre attiva nel tracker)')
 
     # Modalità autoregressiva
     p.add_argument('--autoregressive', type=int, default=1,
@@ -812,6 +796,7 @@ if __name__ == '__main__':
                         'si sovrappone a una box del passato (le past query hanno priorità)')
     p.add_argument('--max_missed', type=int,  default=6,
                    help='Frame consecutivi senza match dopo cui un track viene eliminato')
+    add_tracker_args(p)
 
     # DataLoader
     p.add_argument('--num_workers', type=int, default=4)
